@@ -6,6 +6,20 @@ Format: Keep a Changelog 1.1 style — Added / Changed / Fixed.
 
 ---
 
+## [0.10.1] - 2026-08-26
+
+### Fixed
+- **AVX512 compatibility (bins-v0.6.1)** — v0.6.0 binaries were compiled with AVX512 instructions and crashed on startup with SIGILL (exit 132) on CPUs without AVX512 (e.g. Intel desktop Alder Lake 12th-gen). bins-v0.6.1 is rebuilt with AVX2 only (`GGML_AVX512=OFF`), compatible with all x86_64 CPUs (AVX2 exists on every 2013+ CPU).
+
+### Changed
+- **CUDA 12.8 multi-arch rebuild (bins-v0.6.1 asset refreshed)** — the previous binary shipped with CUDA 11 runtime (compiled against a PATH-shadowed CUDA 11.5 nvcc), which ran on 30-series cards via a non-native path. Rebuilt with CUDA 12.8 toolchain + `CMAKE_CUDA_ARCHITECTURES="61;75;86;89;120a"`; verified on 3060 (sm_86) and 2080 Ti (sm_75). **~2× faster on 3060** (see Verified).
+- `_DEFAULT_BINS_TAG` → `bins-v0.6.1` — multi-arch (sm_61/75/86/89/120a) AVX2 + CUDA 12.8 build; fixes SIGILL on no-AVX512 CPUs while keeping full GPU family support. **Note: CUDA 12 runtime requires NVIDIA driver ≥ 570** (older drivers must upgrade).
+- **Verified 2026-08-26** (Qwen3.6-35B-A3B UD-IQ2_M, thinking disabled):
+  - RTX 3060 12G (sm_86, Win10 + WSL2, no-AVX512 CPU): **23.6 t/s steady-state** (vs 15.5 t/s on CUDA 11 build, +52%), 5.5-5.7 GB VRAM, no SIGILL, full-chain OK — first-ever verified Windows/WSL2 run of moe-l2
+  - RTX 2080 Ti (sm_75, native Linux): 22.3 t/s, VRAM peak 7.2 GB (expert cache active)
+
+---
+
 ## [0.10.0] - 2026-08-22
 
 ### Added
