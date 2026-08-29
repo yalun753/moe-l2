@@ -65,18 +65,18 @@
 moe-l2 start --model model.gguf --gpu --router-map v4_top100.map
 ```
 
-### 多架构二进制（bins-v0.6.0，2026-08-19）
+### 多架构二进制（bins-v0.7.0，2026-08-28）
 
-**一个二进制兼容所有 NVIDIA 消费卡**——GTX 1080（sm_61）到 RTX 50 系（sm_120a）。CUDA 12.8 编译，无需按显卡单独编译，`moe-l2 download-bins` 自动拉取。bins-v0.6.0 含 **selective pin（路由表驱动）** + **GPU cache 预填充** + **on-demand pin 主路径** + 专家页淘汰 v3.1（`MOE_L2_LRU_MAX_EXPERTS=N`）+ 分层 pin（`MOE_L2_PIN_LAYERS`）+ A3 cache 32768 槽 + cuda-libs（无 libnccl，单卡不需要）+ **按领域动态换表（POST /moe-set-domain）** + **per-slot 锁优化（并发正确性恢复——v0.5.0 是无锁版，DS 并发输出必垃圾，已修复）** + **soft_resize / 保留热专家 v2（默认单表，`MOE_L2_POOL_SIZE=3` 可临时开启）** + **显存自适应主表 top-k（≤12G=top-75 / >12G=top-100）** + **proxy 并发修复（换表节流 + 后台重训——DS long 500 消失）** + **flywheel 表持久化（A 修复，重启不再丢领域）** + **DEFAULT_TOP_K 100**。
+**一个二进制兼容所有 NVIDIA 消费卡**——GTX 1080（sm_61）到 RTX 50 系（sm_120a）。CUDA 12.8 编译，无需按显卡单独编译，`moe-l2 download-bins` 自动拉取。bins-v0.7.0 在 v0.6.1（AVX2 + CUDA 12.8 多架构）基础上新增：**IQ1_M 量化修复**（Qwen3.8-Flash-Next / Qwen4exp 125B 512 专家模型不再在 MMQ 崩溃——改走 MMVQ + 批上限拆分）+ **NCCL 多卡支持恢复**（打包内置 `libnccl.so.2`，`--split-mode layer/row/tensor` 恢复可用）+ selective pin（路由表驱动）+ GPU cache 预填充 + on-demand pin 主路径 + 专家页淘汰 v3.1 + 分层 pin + A3 cache 32768 槽 + 按领域动态换表（POST /moe-set-domain）+ per-slot 锁优化 + soft_resize / 保留热专家 v2（默认单表）+ 显存自适应主表 top-k + proxy 并发修复 + flywheel 表持久化。
 
-| GPU | 架构 | DS-V2-Lite | Qwen3.6-A3B | 显存 |
-|-----|------|-----------|-------------|------|
-| RTX 2080 Ti | sm_75（Turing） | 86-94 t/s | 16.6-28.6 t/s | Qwen 5.3 GB / DS 10.0 GB |
-| RTX 3080 Ti | sm_86（Ampere） | 12.25 t/s | 13.28 t/s | ~1.1-2.2 GB |
-| RTX 4090* | sm_89（Ada） | 139-154 t/s | 25.5-44.2 t/s | Qwen 6.7-7.2 GB / DS 10.1 GB |
-| RTX 5090 | sm_120a | **141-151 t/s** | **28-52.5 t/s** | Qwen 5.6 GB / DS 10.2 GB |
+| GPU | 架构 | DS-V2-Lite | Qwen3.6-A3B | Qwen4exp 125B IQ1_M | 显存 |
+|-----|------|-----------|-------------|---------------------|------|
+| RTX 2080 Ti | sm_75（Turing） | 86-94 t/s | 16.6-28.6 t/s | — | Qwen 5.3 GB / DS 10.0 GB |
+| RTX 3080 Ti | sm_86（Ampere） | 12.25 t/s | 13.28 t/s | — | ~1.1-2.2 GB |
+| RTX 4090* | sm_89（Ada） | 139-154 t/s | 25.5-56.3 t/s | **19.8 t/s** | Qwen 6.7-7.2 GB / DS 10.1 GB |
+| RTX 5090 | sm_120a | **141-151 t/s** | **28-52.5 t/s** | — | Qwen 5.6 GB / DS 10.2 GB |
 
-\* 全部行为 **bins-v0.6.0 全链路实测**（2026-08-19，`moe-l2 start --gpu`，按领域换表 + A3 cache，默认单表）：4090——Qwen 25.5-44.2 t/s（混合领域）/ DS 139-154 t/s（单轮 141、长文 139），显存 6.7-7.2/10.1GB，RSS 8.9-11.3 / 6.4-6.7GB；2080 Ti——Qwen 16.6-28.6 / DS 86-94 t/s，显存 5.3/10.0GB；**5090——Qwen 28-52.5（峰值 52.5）/ DS 141-151 t/s，显存 5.6/10.2GB**。3080 Ti 仍为 v3.1 多架构包（bins-v0.3.0）实测。三卡输出全部验证无乱码，2026-08-19。
+\* 全部为全链路实测（`moe-l2 start --gpu`，按领域换表 + A3 cache，默认单表）。**bins-v0.7.0（2026-08-28）**：4090——Qwen4exp 125B IQ1_M **19.8 t/s**（cache hit 97.3%，32768 槽）、Qwen3.6 **56.3 t/s**（第 3 轮，比 v0.6.0 的 44-48 快 17-28%）、DS-V2-Lite **143.5 t/s**（+8%）；2080 Ti——Qwen3.6 **40.3 t/s**（hit 95.1%）。旧行：4090 v0.6.0 Qwen 25.5-44.2（混合领域）/ DS 139-154；2080 Ti v0.6.0 Qwen 16.6-28.6 / DS 86-94；5090 v0.6.0 Qwen 28-52.5 / DS 141-151；3080 Ti 仍为 v3.1 多架构包（bins-v0.3.0）实测。全部输出验证无乱码。**Qwen4exp 125B**——512 专家/层、IQ1_M：此前必崩（MMQ quantize 不支持 IQ1_M → GGML_ABORT）；修复 = 改走 MMVQ + 批上限拆分。三模型 4090 日志：`测试数据备份/4090-bins-v070-verify-20260828/`。
 
 ### 并发请求 — 共享 cache，速度不掉（2026-08-12）
 

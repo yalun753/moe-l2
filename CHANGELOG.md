@@ -6,7 +6,20 @@ Format: Keep a Changelog 1.1 style — Added / Changed / Fixed.
 
 ---
 
-## [0.10.1] - 2026-08-26
+## [0.11.0] - 2026-08-29
+
+### Added
+- **IQ1_M quantization support (bins-v0.7.0)** — Qwen3.8-Flash-Next / Qwen4exp 125B (512 experts/layer, IQ1_M) previously crashed with `GGML_ABORT` in MMQ (`quantize_mmq_q8_1` has no IQ1_M case). Fixed by routing IQ1_M to MMVQ (which supports it) in the A3 dispatch + batch-cap split (`MMVQ_MAX_BATCH_SIZE` chunking). Verified on 4090: Qwen4exp 125B IQ1_M **19.8 t/s**, no crash.
+- **NCCL multi-GPU support restored (bins-v0.7.0)** — `libnccl.so.2` bundled in the release package; `--split-mode layer/row/tensor` works again (GGML_CUDA_NCCL=ON multi-arch build). Multi-card VRAM aggregation for larger models.
+- **Multi-arch rebuild (bins-v0.7.0)** — `CMAKE_CUDA_ARCHITECTURES="61;75;86;89;120a"`, CUDA 12.8, AVX2 (no AVX512), `GGML_BACKEND_DL=ON`.
+
+### Changed
+- `_DEFAULT_BINS_TAG` → `bins-v0.7.0` (IQ1_M fix + NCCL + multi-arch asset).
+- **Verified 2026-08-28 (bins-v0.7.0 full-chain, `moe-l2 start --gpu`)**:
+  - RTX 4090: Qwen4exp 125B IQ1_M **19.8 t/s** (round 3, cache hit 97.3% / 32768 slots), Qwen3.6 **56.3 t/s** (vs v0.6.0 44-48, +17-28%), DS-V2-Lite **143.5 t/s** (vs 133.2, +8%) — 3 models × 3 rounds all clean output, 0 crashes
+  - RTX 2080 Ti: Qwen3.6 **40.3 t/s** (cache hit 95.1%) — no regression vs v0.6.0's 37-39
+
+
 
 ### Fixed
 - **AVX512 compatibility (bins-v0.6.1)** — v0.6.0 binaries were compiled with AVX512 instructions and crashed on startup with SIGILL (exit 132) on CPUs without AVX512 (e.g. Intel desktop Alder Lake 12th-gen). bins-v0.6.1 is rebuilt with AVX2 only (`GGML_AVX512=OFF`), compatible with all x86_64 CPUs (AVX2 exists on every 2013+ CPU).

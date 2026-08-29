@@ -60,18 +60,18 @@ Live capture (2026-08-16, bins-v0.5.0 C-scheme): Qwen3.6-35B-A3B generating **2,
 moe-l2 start --model model.gguf --gpu --router-map v4_top100.map
 ```
 
-### Multi-architecture binaries (bins-v0.6.0, 2026-08-19)
+### Multi-architecture binaries (bins-v0.7.0, 2026-08-28)
 
-One binary for **all NVIDIA consumer GPUs** — GTX 1080 (sm_61) through RTX 50-series (sm_120a). Built with CUDA 12.8; no per-GPU compilation needed. `moe-l2 download-bins` fetches it automatically. bins-v0.6.0 includes the **selective pin (router-map driven)** + **GPU cache prefill** + **on-demand pin main path** + expert-page eviction v3.1 (`MOE_L2_LRU_MAX_EXPERTS=N`) + layered pin (`MOE_L2_PIN_LAYERS`) + A3 cache 32768 slots + cuda-libs (no libnccl — not needed for single-GPU) + **per-domain router table switch (`POST /moe-set-domain`)** + **per-slot lock optimization** (concurrent correctness restored — v0.5.0 was lock-free and DS concurrent output was garbage) + **soft_resize / retain-hot-experts (v2, default single-table; `MOE_L2_POOL_SIZE=3` opt-in)** + **VRAM-adaptive main table top-k (≤12G=top-75 / >12G=top-100)** + **proxy concurrency fixes (throttled domain switch + background retrain — DS long 500 gone)** + **flywheel table persistence (A-fix, no more domain loss on restart)** + **DEFAULT_TOP_K 100**.
+One binary for **all NVIDIA consumer GPUs** — GTX 1080 (sm_61) through RTX 50-series (sm_120a). Built with CUDA 12.8; no per-GPU compilation needed. `moe-l2 download-bins` fetches it automatically. bins-v0.7.0 includes everything from v0.6.1 (AVX2 + CUDA 12.8 multi-arch) plus: **IQ1_M quantization fix** (Qwen3.8-Flash-Next / Qwen4exp 125B 512-expert models no longer crash in MMQ — routes to MMVQ instead) + **NCCL multi-GPU support restored** (`libnccl.so.2` bundled, `--split-mode layer/row/tensor` works again) + selective pin (router-map driven) + GPU cache prefill + on-demand pin main path + expert-page eviction v3.1 + layered pin + A3 cache 32768 slots + per-domain router table switch (`POST /moe-set-domain`) + per-slot lock optimization + soft_resize / retain-hot-experts v2 (default single-table) + VRAM-adaptive main table top-k + proxy concurrency fixes + flywheel table persistence.
 
-| GPU | Architecture | DS-V2-Lite gen | Qwen3.6-A3B gen | VRAM |
-|-----|-------------|----------------|-----------------|------|
-| RTX 2080 Ti | sm_75 (Turing) | 86-94 t/s | 16.6-28.6 t/s | Qwen 5.3 GB / DS 10.0 GB |
-| RTX 3080 Ti | sm_86 (Ampere) | 12.25 t/s | 13.28 t/s | ~1.1-2.2 GB |
-| RTX 4090* | sm_89 (Ada) | 139-154 t/s | 25.5-44.2 t/s | Qwen 6.7-7.2 GB / DS 10.1 GB |
-| RTX 5090 | sm_120a | **141-151 t/s** | **28-52.5 t/s** | Qwen 5.6 GB / DS 10.2 GB |
+| GPU | Architecture | DS-V2-Lite gen | Qwen3.6-A3B gen | Qwen4exp 125B IQ1_M | VRAM |
+|-----|-------------|----------------|-----------------|---------------------|------|
+| RTX 2080 Ti | sm_75 (Turing) | 86-94 t/s | 16.6-28.6 t/s | — | Qwen 5.3 GB / DS 10.0 GB |
+| RTX 3080 Ti | sm_86 (Ampere) | 12.25 t/s | 13.28 t/s | — | ~1.1-2.2 GB |
+| RTX 4090* | sm_89 (Ada) | 139-154 t/s | 25.5-56.3 t/s | **19.8 t/s** | Qwen 6.7-7.2 GB / DS 10.1 GB |
+| RTX 5090 | sm_120a | **141-151 t/s** | **28-52.5 t/s** | — | Qwen 5.6 GB / DS 10.2 GB |
 
-\* All rows = **bins-v0.6.0 full-chain** (2026-08-19, `moe-l2 start --gpu`, per-domain table switch + A3 cache, default single-table). 4090: Qwen 25.5-44.2 t/s (mixed-domain) / DS 139-154 t/s (single-turn 141, long-context 139), VRAM 6.7-7.2/10.1 GB, RSS 8.9-11.3 / 6.4-6.7 GB; 2080 Ti: Qwen 16.6-28.6 / DS 86-94 t/s, VRAM 5.3/10.0 GB; 5090: Qwen 28-52.5 (peak 52.5) / DS 141-151 t/s, VRAM 5.6/10.2 GB. 3080 Ti row remains v3.1 multi-arch (bins-v0.3.0). All outputs verified clean (no garbage) on all three cards, 2026-08-19.
+\* Rows = full-chain measured (`moe-l2 start --gpu`, per-domain table switch + A3 cache, default single-table). **bins-v0.7.0 (2026-08-28)**: 4090 — Qwen4exp 125B IQ1_M **19.8 t/s** (cache hit 97.3%, 32768 slots), Qwen3.6 **56.3 t/s** (round 3, +17-28% vs v0.6.0's 44-48), DS-V2-Lite **143.5 t/s** (+8%); 2080 Ti — Qwen3.6 **40.3 t/s** (hit 95.1%). Older rows: 4090 v0.6.0 Qwen 25.5-44.2 (mixed-domain) / DS 139-154; 2080 Ti v0.6.0 Qwen 16.6-28.6 / DS 86-94; 5090 v0.6.0 Qwen 28-52.5 / DS 141-151; 3080 Ti v3.1 multi-arch (bins-v0.3.0). All outputs verified clean (no garbage). **Qwen4exp 125B** — 512 experts/layer, IQ1_M: previously crashed (`GGML_ABORT` in MMQ quantize, no support for IQ1_M); fixed by routing to MMVQ + batch-cap split. 3-model 4090 log: `测试数据备份/4090-bins-v070-verify-20260828/`.
 
 ### Concurrent requests — shared cache, no speed loss (2026-08-12)
 
