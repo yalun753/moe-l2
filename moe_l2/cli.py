@@ -383,6 +383,18 @@ def main():
         ),
     )
     start_parser.add_argument(
+        "--backend-url",
+        type=str,
+        default=None,
+        help=(
+            "[moe-l2 2026-08-30 remote] Proxy a REMOTE llama-server (e.g. "
+            "http://192.168.31.210:11436). Skips local binary/model startup; "
+            "proxy + gate (domain prediction + POST /moe-set-domain) still work. "
+            "--model is treated as a model_id (e.g. 'qwen') to pick the flywheel "
+            "table; default 'qwen'."
+        ),
+    )
+    start_parser.add_argument(
         "--router-map",
         type=str,
         default=None,
@@ -754,6 +766,48 @@ def cmd_model_download(args):
 
 def cmd_start(args):
     print(f"moe-l2 {__version__} — starting L2 scheduler + proxy")
+
+    # [moe-l2 2026-08-30 remote] 代理远程 llama-server（如 210 Windows 机器）：
+    # 不启动本地二进制/不解析本地模型，proxy + gate（领域预测 + /moe-set-domain
+    # 动态换表）照常工作。--model 传 model_id（默认 qwen）选 flywheel 表。
+    remote_url = getattr(args, "backend_url", None)
+    if remote_url:
+        print("moe-l2 — remote proxy mode (no local llama-server)")
+        print(f"  backend:  {remote_url}")
+        backend_url = remote_url
+        gate = None
+        try:
+            from .gate import RoutingProfiler
+            from .predictor import load_mapping
+            from .domain_router_flywheel import DomainRouterFlywheel
+            from .router_table import model_id_from_path
+            _model_arg = getattr(args, "model", None)
+            _fw_model_id = (
+                model_id_from_path(_model_arg)
+                if _model_arg and _model_arg not in ("auto", "")
+                else "qwen"
+            )
+            router_flywheel = DomainRouterFlywheel(model_id=_fw_model_id)
+            gate = RoutingProfiler(
+                cache=None,
+                expert_map=load_mapping(model_id=_fw_model_id),
+                router_flywheel=router_flywheel,
+                router_server_url=backend_url,
+            )
+            print(f"  gate:     online routing adaptation ({backend_url}/moe-set-domain)")
+            print(f"  flywheel: {_fw_model_id}")
+        except Exception as e:
+            logger.warning("Gate init failed (non-fatal): %s", e)
+            gate = None
+        print(f"  proxy:    127.0.0.1:{args.port} → {backend_url}")
+        print()
+        print("Connect your client to http://127.0.0.1:{}".format(args.port))
+        print("Press Ctrl+C to stop")
+        try:
+            start_proxy(port=args.port, cache=None, backend_url=backend_url, gate=gate)
+        except KeyboardInterrupt:
+            pass
+        return 0
 
     # Find model file
     model_path = _find_gguf(args.model)

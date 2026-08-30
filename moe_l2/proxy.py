@@ -175,6 +175,21 @@ class MoEL2ProxyHandler(BaseHTTPRequestHandler):
         # L0a touch 独立于 L2 cache：动态 pin 场景不依赖 /dev/shm
         touch_enabled = bool(_MODEL_PATH and _PRETOUCH_GB > 0)
         if not self.cache and not touch_enabled:
+            # [2026-08-29 210 自动换表] cache 未启用时仍要让 gate 换表：
+            # proxy 转发远程 backend（如 210），gate.on_request 负责预测领域
+            # → POST /moe-set-domain（领域切换 = 热区刷新）。放行纯 gate 模式。
+            try:
+                # 三层预测：关键词 → TF-IDF 分类器 → 语义兜底
+                enable_tfidf()
+                domain = predict_hybrid(text)
+                logger.info("Predicted domain: %s", domain)
+                if getattr(self, "gate", None) is not None:
+                    try:
+                        self.gate.on_request(domain)
+                    except Exception as ge:
+                        logger.warning("Gate request signal failed (non-fatal): %s", ge)
+            except Exception:
+                pass
             return
         try:
             # 三层预测：关键词 → TF-IDF 分类器 → 语义兜底（提升样本标签质量）
