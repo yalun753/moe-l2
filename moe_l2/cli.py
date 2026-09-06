@@ -18,6 +18,7 @@ import sys
 import tarfile
 import threading
 import time
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -29,6 +30,14 @@ from .proxy import DEFAULT_HOST, DEFAULT_PORT, LLAMA_SERVER_BASE, start_proxy
 
 logger = logging.getLogger("moe-l2")
 
+# ────────────────────────────────────────────────────────────────
+# Platform detection (Windows support added in bins-v0.8.0 / PyPI 0.12.0)
+# ────────────────────────────────────────────────────────────────
+_IS_WINDOWS = os.name == "nt"
+_LLAMA_SERVER_NAME = "llama-server.exe" if _IS_WINDOWS else "llama-server"
+_LLAMA_CLI_NAME = "llama-cli.exe" if _IS_WINDOWS else "llama-cli"
+_BINS_ASSET_NAME = "llama_bins_win.zip" if _IS_WINDOWS else "llama_bins.tar.gz"
+
 # Common GGUF search paths
 _GGUF_PATHS = [
     "/opt/data/models/Qwen2.5-MOE-2X1.5B-Q2_k.gguf",
@@ -39,13 +48,14 @@ _GGUF_PATHS = [
 # GitHub release info
 _GITHUB_REPO = "yalun753/moe-l2"
 _BINS_ASSET_URL = (
-    "https://github.com/{repo}/releases/download/{tag}/llama_bins.tar.gz"
+    "https://github.com/{repo}/releases/download/{tag}/" + _BINS_ASSET_NAME
 )
-_DEFAULT_BINS_TAG = "bins-v0.7.0"
+_DEFAULT_BINS_TAG = "bins-v0.8.0"
 
 # Where the bundled llama-server lives (relative to this file)
 _BUNDLE_DIR = Path(__file__).resolve().parent / "bin"
-_LLAMA_SERVER_PATH = _BUNDLE_DIR / "llama-server"
+_LLAMA_SERVER_PATH = _BUNDLE_DIR / _LLAMA_SERVER_NAME
+_LLAMA_CLI_PATH = _BUNDLE_DIR / _LLAMA_CLI_NAME
 _GPU_PORT = 11436  # llama-server listens here; proxy forwards to it
 
 # Model catalog for `moe-l2 model download` (hf-mirror.com mirrors HuggingFace)
@@ -111,7 +121,7 @@ def _parse_l2_size(size_str: str, expert_size: int) -> int:
 def _ensure_bins(tag: str | None = None) -> bool:
     """Download bundled binaries if not present. Returns True if ready."""
     # Self-heal: older releases extract as bin/bin/llama-server (nested prefix).
-    if not _LLAMA_SERVER_PATH.exists() and (_BUNDLE_DIR / "bin" / "llama-server").exists():
+    if not _LLAMA_SERVER_PATH.exists() and (_BUNDLE_DIR / "bin" / _LLAMA_SERVER_NAME).exists():
         _flatten_nested_bins()
     if _LLAMA_SERVER_PATH.exists():
         return True
@@ -147,7 +157,7 @@ def _flatten_nested_bins() -> None:
 
 
 def _download_bins(tag: str) -> bool:
-    """Download and extract the pre-built llama-server + .so bundle."""
+    """Download and extract the pre-built llama-server bundle for this platform."""
     url = _BINS_ASSET_URL.format(repo=_GITHUB_REPO, tag=tag)
     print(f"  Downloading binaries from {url} ...")
     try:
@@ -157,15 +167,21 @@ def _download_bins(tag: str) -> bool:
         print(f"  ERROR: Failed to download: {e}")
         return False
 
-    tgz_path = _BUNDLE_DIR / "llama_bins.tar.gz"
     _BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
-    tgz_path.write_bytes(resp.content)
-
-    print(f"  Extracting to {_BUNDLE_DIR} ...")
-    with tarfile.open(tgz_path, "r:gz") as tf:
-        tf.extractall(path=_BUNDLE_DIR)
-
-    tgz_path.unlink()  # cleanup
+    if _IS_WINDOWS:
+        zip_path = _BUNDLE_DIR / "llama_bins_win.zip"
+        zip_path.write_bytes(resp.content)
+        print(f"  Extracting to {_BUNDLE_DIR} ...")
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(path=_BUNDLE_DIR)
+        zip_path.unlink()  # cleanup
+    else:
+        tgz_path = _BUNDLE_DIR / "llama_bins.tar.gz"
+        tgz_path.write_bytes(resp.content)
+        print(f"  Extracting to {_BUNDLE_DIR} ...")
+        with tarfile.open(tgz_path, "r:gz") as tf:
+            tf.extractall(path=_BUNDLE_DIR)
+        tgz_path.unlink()  # cleanup
 
     # Self-heal: tarballs from bins-v0.2.0 ship a bin/ prefix → bin/bin/llama-server
     _flatten_nested_bins()
@@ -173,9 +189,9 @@ def _download_bins(tag: str) -> bool:
     # Verify
     if _LLAMA_SERVER_PATH.exists():
         size = _LLAMA_SERVER_PATH.stat().st_size
-        print(f"  OK: llama-server ({size} bytes)")
+        print(f"  OK: {_LLAMA_SERVER_NAME} ({size} bytes)")
         return True
-    print("  ERROR: llama-server not found after extraction")
+    print(f"  ERROR: {_LLAMA_SERVER_NAME} not found after extraction")
     return False
 
 
@@ -203,16 +219,18 @@ def _start_llama_server(
         )
 
     env = os.environ.copy()
-    # Point dynamic linker at bundled .so files (bin + cuda-libs).
-    # cuda-libs ships libcudart/libcublas/libcublasLt/libnccl — the target
-    # machine may only have a bare NVIDIA driver without the CUDA runtime.
-    lib_paths = [str(_BUNDLE_DIR)]
-    cuda_libs = _BUNDLE_DIR / "cuda-libs"
-    if cuda_libs.is_dir():
-        lib_paths.append(str(cuda_libs))
-    env["LD_LIBRARY_PATH"] = (
-        ":".join(lib_paths) + ":" + env.get("LD_LIBRARY_PATH", "")
-    )
+    if not _IS_WINDOWS:
+        # Point dynamic linker at bundled .so files (bin + cuda-libs).
+        # cuda-libs ships libcudart/libcublas/libcublasLt/libnccl — the target
+        # machine may only have a bare NVIDIA driver without the CUDA runtime.
+        # (Windows: DLLs next to llama-server.exe are auto-loaded, no env needed.)
+        lib_paths = [str(_BUNDLE_DIR)]
+        cuda_libs = _BUNDLE_DIR / "cuda-libs"
+        if cuda_libs.is_dir():
+            lib_paths.append(str(cuda_libs))
+        env["LD_LIBRARY_PATH"] = (
+            ":".join(lib_paths) + ":" + env.get("LD_LIBRARY_PATH", "")
+        )
     # Force expert MUL_MAT_ID ops onto GPU even at batch=1 (single-token decode).
     # Default GGML_OP_OFFLOAD_MIN_BATCH is 32 (ggml-cuda.cu), so decode would keep
     # experts on CPU. With host-buffer experts (llama-model-loader moe-l2 patch),
@@ -539,6 +557,10 @@ def main():
             return 1
     elif args.command == "collect":
         from .collect import cmd_collect
+        # [moe-l2 2026-09-06 Windows] 未显式指定 --llama-cli 时自动用捆绑的
+        # llama-cli(.exe)（download-bins 产物），Windows 用户零配置。
+        if not args.llama_cli and _LLAMA_CLI_PATH.exists():
+            args.llama_cli = str(_LLAMA_CLI_PATH)
         return cmd_collect(args)
     elif args.command == "embed-map":
         import os as _os
@@ -592,9 +614,13 @@ def _check_nvidia() -> tuple[bool, str]:
 
 
 def _check_cuda_lib() -> tuple[bool, str]:
-    """Check libcuda.so is loadable (needed by bundled .so bundle)."""
+    """Check the NVIDIA CUDA driver library is loadable."""
     import ctypes
     try:
+        if _IS_WINDOWS:
+            # Windows: driver exposes nvcuda.dll (no CUDA toolkit install needed)
+            ctypes.CDLL("nvcuda.dll")
+            return True, "nvcuda.dll found"
         ctypes.CDLL("libcuda.so.1")
         return True, "libcuda.so.1 found"
     except OSError:
@@ -633,9 +659,17 @@ def _check_dynamic_libs() -> tuple[bool, str]:
 
     The existence check alone is not enough: a binary can be present but fail
     to launch when a shared library (e.g. libnccl.so.2) is missing.
+    (Windows: DLLs ship next to llama-server.exe — existence check suffices.)
     """
     if not _LLAMA_SERVER_PATH.exists():
         return False, "llama-server missing — run 'moe-l2 download-bins'"
+    if _IS_WINDOWS:
+        dlls = list(_BUNDLE_DIR.glob("*.dll"))
+        missing = [d for d in ("ggml.dll", "ggml-base.dll", "ggml-cuda.dll")
+                   if not (_BUNDLE_DIR / d).exists()]
+        if missing:
+            return False, "missing DLLs: " + "; ".join(missing)
+        return True, f"llama-server + {len(dlls)} DLLs present"
     env = os.environ.copy()
     lib_paths = [str(_BUNDLE_DIR)]
     cuda_libs = _BUNDLE_DIR / "cuda-libs"
@@ -777,9 +811,9 @@ def cmd_start(args):
         backend_url = remote_url
         gate = None
         try:
+            from .domain_router_flywheel import DomainRouterFlywheel
             from .gate import RoutingProfiler
             from .predictor import load_mapping
-            from .domain_router_flywheel import DomainRouterFlywheel
             from .router_table import model_id_from_path
             _model_arg = getattr(args, "model", None)
             _fw_model_id = (

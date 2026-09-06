@@ -6,6 +6,48 @@ Format: Keep a Changelog 1.1 style — Added / Changed / Fixed.
 
 ---
 
+## [0.12.0] - 2026-09-06
+
+### Added
+- **Windows native support (bins-v0.8.0)** — pre-built Windows engine (`llama_bins_win.zip`: llama-server.exe + llama-cli.exe + all DLLs, multi-arch cubins sm_60/61/70/75/86/89/120a, AVX2, CUDA 12.8 runtime DLLs bundled). Windows users no longer need WSL2: `pip install moe-l2` → `moe-l2 download-bins` (auto-picks the zip) → `moe-l2 start --model X --gpu`. Same A3 expert cache / router-map / on-demand-pin engine as Linux. Verified on RTX 3060 12G (see Verified).
+- **Remote backend proxy mode** — `moe-l2 start --backend-url http://host:port` proxies a remote llama-server without spawning a local binary; domain prediction + auto table-switch (`POST /moe-set-domain`) still work. Enables the NAS-scheduler → Windows-engine full-chain topology.
+- **`MOE_L2_HOST` env override for the proxy** — `MOE_L2_HOST=0.0.0.0` binds the proxy to all interfaces so LAN devices can use the full chain (default stays 127.0.0.1).
+- **P100 / V100 / Titan V support (bins-v0.8.0 Linux asset rebuilt)** — `CMAKE_CUDA_ARCHITECTURES` extended to `60;61;70;75;86;89;120a` (adds sm_60 + sm_70); code otherwise unchanged from bins-v0.7.0. Package size +100-200 MB.
+
+### Changed
+- `_DEFAULT_BINS_TAG` → `bins-v0.8.0`.
+- `moe-l2 download-bins` is now platform-aware: Windows downloads `llama_bins_win.zip` (zipfile), Linux downloads `llama_bins.tar.gz` (tarfile).
+- `moe-l2 collect` auto-finds the bundled `llama-cli(.exe)` when `--llama-cli` is not given.
+- doctor: CUDA-driver check uses `nvcuda.dll` on Windows; dynamic-lib check validates bundled DLLs instead of `ldd`.
+
+### Fixed
+- Windows engine launch no longer sets `LD_LIBRARY_PATH` (DLLs next to llama-server.exe auto-load); Linux path unchanged.
+
+### Verified
+- **Windows native (non-WSL2) RTX 3060 12G, Qwen3.6-35B-A3B UD-IQ2_M, -c 32768, CUDA 12.8 runtime, GGML_CUDA_EXPERT_CACHE=1** (2026-09-06, bins-v0.8.0 engine, v080f release matrix):
+  - Release matrix **9/9 PASS**: 6-round short dialog clean Chinese output ×6 / 4.3K long-ctx summary correct (prompt_tokens=3353) / 3-way concurrency wall=2.1s / speed prompt_ps=126.6 + predicted_ps=37.2
+  - Cold-start first request predicted_ps=27.6 (gate ≥21 PASS); zero slash-garbage characters throughout
+  - Root cause of the old Windows garbage output: missing `ggml_cuda_get_backend_stream` export → D2D expert copies landed on the default stream racing consumer kernels; rebuilt from the current tree → zero garbage
+
+---
+
+---
+
+## [0.11.0] - 2026-08-29
+
+### Added
+- **IQ1_M quantization support (bins-v0.7.0)** — Qwen3.8-Flash-Next / Qwen4exp 125B (512 experts/layer, IQ1_M) previously crashed with `GGML_ABORT` in MMQ (`quantize_mmq_q8_1` has no IQ1_M case). Fixed by routing IQ1_M to MMVQ (which supports it) in the A3 dispatch + batch-cap split (`MMVQ_MAX_BATCH_SIZE` chunking). Verified on 4090: Qwen4exp 125B IQ1_M **19.8 t/s**, no crash.
+- **NCCL multi-GPU support restored (bins-v0.7.0)** — `libnccl.so.2` bundled in the release package; `--split-mode layer/row/tensor` works again (GGML_CUDA_NCCL=ON multi-arch build).
+- **Multi-arch rebuild (bins-v0.7.0)** — `CMAKE_CUDA_ARCHITECTURES="61;75;86;89;120a"`, CUDA 12.8, AVX2 (no AVX512), `GGML_BACKEND_DL=ON`.
+
+### Changed
+- `_DEFAULT_BINS_TAG` → `bins-v0.7.0`.
+- **Verified 2026-08-28 (bins-v0.7.0 full-chain)**: RTX 4090 Qwen4exp 125B IQ1_M 19.8 t/s (hit 97.3%), Qwen3.6 56.3 t/s, DS-V2-Lite 143.5 t/s; RTX 2080 Ti Qwen3.6 40.3 t/s — 3 models × 3 rounds clean, 0 crashes.
+
+---
+
+---
+
 ## [0.10.1] - 2026-08-26
 
 ### Fixed

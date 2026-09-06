@@ -60,9 +60,9 @@ Live capture (2026-08-16, bins-v0.5.0 C-scheme): Qwen3.6-35B-A3B generating **2,
 moe-l2 start --model model.gguf --gpu --router-map v4_top100.map
 ```
 
-### Multi-architecture binaries (bins-v0.7.0, 2026-08-28)
+### Multi-architecture binaries (bins-v0.8.0, 2026-09-06)
 
-One binary for **all NVIDIA consumer GPUs** — GTX 1080 (sm_61) through RTX 50-series (sm_120a). Built with CUDA 12.8; no per-GPU compilation needed. `moe-l2 download-bins` fetches it automatically. bins-v0.7.0 includes everything from v0.6.1 (AVX2 + CUDA 12.8 multi-arch) plus: **IQ1_M quantization fix** (Qwen3.8-Flash-Next / Qwen4exp 125B 512-expert models no longer crash in MMQ — routes to MMVQ instead) + **NCCL multi-GPU support restored** (`libnccl.so.2` bundled, `--split-mode layer/row/tensor` works again) + selective pin (router-map driven) + GPU cache prefill + on-demand pin main path + expert-page eviction v3.1 + layered pin + A3 cache 32768 slots + per-domain router table switch (`POST /moe-set-domain`) + per-slot lock optimization + soft_resize / retain-hot-experts v2 (default single-table) + VRAM-adaptive main table top-k + proxy concurrency fixes + flywheel table persistence.
+One binary for **all NVIDIA GPUs** — GTX 1080 (sm_61) / P100 (sm_60) through RTX 50-series (sm_120a), plus native Windows (`llama_bins_win.zip`, since bins-v0.8.0). Built with CUDA 12.8; no per-GPU compilation needed. `moe-l2 download-bins` fetches it automatically (platform-aware since PyPI 0.12.0). bins-v0.8.0 extends the v0.7.0 engine with **sm_60 + sm_70** (P100 / V100 / Titan V) and ships a **Windows zip** (llama-server.exe + DLLs, AVX2, CUDA 12.8 runtime bundled, driver ≥ 570). v0.7.0's features carry over: **IQ1_M quantization fix** (Qwen3.8-Flash-Next / Qwen4exp 125B 512-expert models no longer crash in MMQ — routes to MMVQ instead) + **NCCL multi-GPU support restored** (`libnccl.so.2` bundled, `--split-mode layer/row/tensor` works again) + selective pin (router-map driven) + GPU cache prefill + on-demand pin main path + expert-page eviction v3.1 + layered pin + A3 cache 32768 slots + per-domain router table switch (`POST /moe-set-domain`) + per-slot lock optimization + soft_resize / retain-hot-experts v2 (default single-table) + VRAM-adaptive main table top-k + proxy concurrency fixes + flywheel table persistence.
 
 | GPU | Architecture | DS-V2-Lite gen | Qwen3.6-A3B gen | Qwen4exp 125B IQ1_M | VRAM |
 |-----|-------------|----------------|-----------------|---------------------|------|
@@ -247,14 +247,27 @@ Options:
 - `--port 11435` (default)
 - `--gpu`: enable GPU mode (requires CUDA + NVIDIA GPU; spawns bundled on-demand pin llama-server on 11436)
 
-> **GPU binaries**: Not tracked in git (bundled as `llama_bins.tar.gz`, ~1.6 GB multi-architecture on the `bins-v0.6.0` release — sm_61/75/86/89/120a, one binary for all NVIDIA consumer GPUs, ships cuda-libs). Fetched at runtime via `moe-l2 download-bins`. When you `pip install moe-l2`, binaries are included. For git-clone users, run `moe-l2 download-bins` to fetch them from GitHub Release.
+> **GPU binaries**: Not tracked in git (bundled as `llama_bins.tar.gz` on Linux / `llama_bins_win.zip` on Windows, multi-architecture — sm_60/61/70/75/86/89/120a since bins-v0.8.0, one binary for all NVIDIA GPUs incl. P100/V100, ships cuda-libs/CUDA runtime DLLs). Fetched at runtime via `moe-l2 download-bins` (platform-aware since PyPI 0.12.0). When you `pip install moe-l2`, binaries are included. For git-clone users, run `moe-l2 download-bins` to fetch them from GitHub Release.
 
 ## Platform requirements
 
-- **Linux x86_64 only** — pre-built binaries target Linux AMD64 (CUDA `.so` + `llama-server`)
-- macOS, Windows, and ARM Linux are **not supported**
+- **Linux x86_64 + NVIDIA GPU** — primary platform (CUDA `.so` + `llama-server` bundle)
+- **Windows 10/11 x64 + NVIDIA GPU** — native support since bins-v0.8.0 (`llama_bins_win.zip`, llama-server.exe + DLLs; same A3 expert cache / router-map features as Linux)
+- macOS, and ARM Linux are **not supported**
 - **NVMe SSD strongly recommended**
 - NVIDIA GPU required for `--gpu` mode
+
+### Windows (native, bins-v0.8.0+)
+
+Install moe-l2 normally, then fetch the Windows engine — `download-bins` auto-picks `llama_bins_win.zip` on Windows:
+
+```
+pip install moe-l2
+moe-l2 download-bins
+moe-l2 start --model C:\models\Qwen3.6-35B-A3B-UD-IQ2_M.gguf --gpu
+```
+
+The zip ships `llama-server.exe` + `llama-cli.exe` + all DLLs (multi-arch cubins: sm_60/61/70/75/86/89/120a, AVX2, CUDA 12.8 runtime DLLs included — no CUDA Toolkit install needed, NVIDIA driver ≥ 570 required). To generate a per-domain router map on Windows, run `moe-l2 collect --model <your.gguf>` (uses the bundled llama-cli.exe automatically). Verified on RTX 3060 12 GB (Qwen3.6-35B-A3B ~21-22 t/s LRU hot-cache, same engine as Linux).
 
 ## More data
 

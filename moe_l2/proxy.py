@@ -23,7 +23,9 @@ if False:  # TYPE_CHECKING only
 
 logger = logging.getLogger("moe-l2-proxy")
 
-DEFAULT_HOST = "127.0.0.1"
+# [moe-l2 2026-09-05] 监听地址支持 env 覆盖：MOE_L2_HOST=0.0.0.0 可让局域网
+# 其他设备（如 210 WebUI / Hermes）经本 proxy 走全链路（L0 领域预测 + 自动换表）。
+DEFAULT_HOST = os.environ.get("MOE_L2_HOST", "127.0.0.1")
 DEFAULT_PORT = 11435
 OLLAMA_BASE = "http://127.0.0.1:11434"
 LLAMA_SERVER_BASE = "http://127.0.0.1:11436"

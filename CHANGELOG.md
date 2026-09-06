@@ -6,20 +6,48 @@ Format: Keep a Changelog 1.1 style — Added / Changed / Fixed.
 
 ---
 
+## [0.12.0] - 2026-09-06
+
+### Added
+- **Windows native support (bins-v0.8.0)** — pre-built Windows engine (`llama_bins_win.zip`: llama-server.exe + llama-cli.exe + all DLLs, multi-arch cubins sm_60/61/70/75/86/89/120a, AVX2, CUDA 12.8 runtime DLLs bundled). Windows users no longer need WSL2: `pip install moe-l2` → `moe-l2 download-bins` (auto-picks the zip) → `moe-l2 start --model X --gpu`. Same A3 expert cache / router-map / on-demand-pin engine as Linux. Verified on RTX 3060 12G (see Verified).
+- **Remote backend proxy mode** — `moe-l2 start --backend-url http://host:port` proxies a remote llama-server without spawning a local binary; domain prediction + auto table-switch (`POST /moe-set-domain`) still work. Enables the NAS-scheduler → Windows-engine full-chain topology.
+- **`MOE_L2_HOST` env override for the proxy** — `MOE_L2_HOST=0.0.0.0` binds the proxy to all interfaces so LAN devices can use the full chain (default stays 127.0.0.1).
+- **P100 / V100 / Titan V support (bins-v0.8.0 Linux asset rebuilt)** — `CMAKE_CUDA_ARCHITECTURES` extended to `60;61;70;75;86;89;120a` (adds sm_60 + sm_70); code otherwise unchanged from bins-v0.7.0. Package size +100-200 MB.
+
+### Changed
+- `_DEFAULT_BINS_TAG` → `bins-v0.8.0`.
+- `moe-l2 download-bins` is now platform-aware: Windows downloads `llama_bins_win.zip` (zipfile), Linux downloads `llama_bins.tar.gz` (tarfile).
+- `moe-l2 collect` auto-finds the bundled `llama-cli(.exe)` when `--llama-cli` is not given.
+- doctor: CUDA-driver check uses `nvcuda.dll` on Windows; dynamic-lib check validates bundled DLLs instead of `ldd`.
+
+### Fixed
+- Windows engine launch no longer sets `LD_LIBRARY_PATH` (DLLs next to llama-server.exe auto-load); Linux path unchanged.
+
+### Verified
+- **Windows 原生（非 WSL2）RTX 3060 12G，Qwen3.6-35B-A3B UD-IQ2_M，-c 32768，CUDA 12.8 runtime，GGML_CUDA_EXPERT_CACHE=1**（2026-09-06，bins-v0.8.0 引擎，v080f 实测矩阵）：
+  - 发布级矩阵 **9/9 PASS**：短对话 6 轮中文输出干净 ×6 / 4.3K 长上下文总结正确（prompt_tokens=3353）/ 并发 3 路 wall=2.1s / 测速 prompt_ps=126.6 + predicted_ps=37.2
+  - 冷启动首请求 predicted_ps=27.6（判据 ≥21 PASS）；全程斜杠乱码计数 0
+  - 乱码根因：旧树缺 `ggml_cuda_get_backend_stream` 导出 → D2D expert 拷贝落默认流与消费核多流竞态；换当前树重编后零乱码
+
+---
+
 ## [0.11.0] - 2026-08-29
 
 ### Added
 - **IQ1_M quantization support (bins-v0.7.0)** — Qwen3.8-Flash-Next / Qwen4exp 125B (512 experts/layer, IQ1_M) previously crashed with `GGML_ABORT` in MMQ (`quantize_mmq_q8_1` has no IQ1_M case). Fixed by routing IQ1_M to MMVQ (which supports it) in the A3 dispatch + batch-cap split (`MMVQ_MAX_BATCH_SIZE` chunking). Verified on 4090: Qwen4exp 125B IQ1_M **19.8 t/s**, no crash.
-- **NCCL multi-GPU support restored (bins-v0.7.0)** — `libnccl.so.2` bundled in the release package; `--split-mode layer/row/tensor` works again (GGML_CUDA_NCCL=ON multi-arch build). Multi-card VRAM aggregation for larger models.
+- **NCCL multi-GPU support restored (bins-v0.7.0)** — `libnccl.so.2` bundled in the release package; `--split-mode layer/row/tensor` works again (GGML_CUDA_NCCL=ON multi-arch build).
 - **Multi-arch rebuild (bins-v0.7.0)** — `CMAKE_CUDA_ARCHITECTURES="61;75;86;89;120a"`, CUDA 12.8, AVX2 (no AVX512), `GGML_BACKEND_DL=ON`.
 
 ### Changed
-- `_DEFAULT_BINS_TAG` → `bins-v0.7.0` (IQ1_M fix + NCCL + multi-arch asset).
-- **Verified 2026-08-28 (bins-v0.7.0 full-chain, `moe-l2 start --gpu`)**:
-  - RTX 4090: Qwen4exp 125B IQ1_M **19.8 t/s** (round 3, cache hit 97.3% / 32768 slots), Qwen3.6 **56.3 t/s** (vs v0.6.0 44-48, +17-28%), DS-V2-Lite **143.5 t/s** (vs 133.2, +8%) — 3 models × 3 rounds all clean output, 0 crashes
-  - RTX 2080 Ti: Qwen3.6 **40.3 t/s** (cache hit 95.1%) — no regression vs v0.6.0's 37-39
+- `_DEFAULT_BINS_TAG` → `bins-v0.7.0`.
+- **Verified 2026-08-28 (bins-v0.7.0 full-chain)**: RTX 4090 Qwen4exp 125B IQ1_M 19.8 t/s (hit 97.3%), Qwen3.6 56.3 t/s, DS-V2-Lite 143.5 t/s; RTX 2080 Ti Qwen3.6 40.3 t/s — 3 models × 3 rounds clean, 0 crashes.
+
+---
+
+---
 
 
+## [0.10.1] - 2026-08-26
 
 ### Fixed
 - **AVX512 compatibility (bins-v0.6.1)** — v0.6.0 binaries were compiled with AVX512 instructions and crashed on startup with SIGILL (exit 132) on CPUs without AVX512 (e.g. Intel desktop Alder Lake 12th-gen). bins-v0.6.1 is rebuilt with AVX2 only (`GGML_AVX512=OFF`), compatible with all x86_64 CPUs (AVX2 exists on every 2013+ CPU).
@@ -30,6 +58,8 @@ Format: Keep a Changelog 1.1 style — Added / Changed / Fixed.
 - **Verified 2026-08-26** (Qwen3.6-35B-A3B UD-IQ2_M, thinking disabled):
   - RTX 3060 12G (sm_86, Win10 + WSL2, no-AVX512 CPU): **23.6 t/s steady-state** (vs 15.5 t/s on CUDA 11 build, +52%), 5.5-5.7 GB VRAM, no SIGILL, full-chain OK — first-ever verified Windows/WSL2 run of moe-l2
   - RTX 2080 Ti (sm_75, native Linux): 22.3 t/s, VRAM peak 7.2 GB (expert cache active)
+
+---
 
 ---
 

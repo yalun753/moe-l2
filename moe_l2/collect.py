@@ -139,8 +139,11 @@ def collect_routing(llama_cli: str, model_path: str, prompt: str, n_tokens: int,
     """
     env = os.environ.copy()
     env["LLAMA_EXPERT_LOG"] = "1"
-    lib_dir = os.path.dirname(llama_cli)
-    env["LD_LIBRARY_PATH"] = lib_dir + (":" + env.get("LD_LIBRARY_PATH", "") if env.get("LD_LIBRARY_PATH") else "")
+    if os.name != "nt":
+        # Linux: point dynamic linker at the bundled .so files next to llama-cli.
+        # Windows: DLLs next to llama-cli.exe are auto-loaded.
+        lib_dir = os.path.dirname(llama_cli)
+        env["LD_LIBRARY_PATH"] = lib_dir + (":" + env.get("LD_LIBRARY_PATH", "") if env.get("LD_LIBRARY_PATH") else "")
 
     cmd = [llama_cli, "-m", model_path, "-p", prompt, "-n", str(n_tokens),
            "--no-display-prompt", "-c", "2048", "-t", "16", "--no-warmup"]

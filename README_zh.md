@@ -65,9 +65,9 @@
 moe-l2 start --model model.gguf --gpu --router-map v4_top100.map
 ```
 
-### 多架构二进制（bins-v0.7.0，2026-08-28）
+### 多架构二进制（bins-v0.8.0，2026-09-06）
 
-**一个二进制兼容所有 NVIDIA 消费卡**——GTX 1080（sm_61）到 RTX 50 系（sm_120a）。CUDA 12.8 编译，无需按显卡单独编译，`moe-l2 download-bins` 自动拉取。bins-v0.7.0 在 v0.6.1（AVX2 + CUDA 12.8 多架构）基础上新增：**IQ1_M 量化修复**（Qwen3.8-Flash-Next / Qwen4exp 125B 512 专家模型不再在 MMQ 崩溃——改走 MMVQ + 批上限拆分）+ **NCCL 多卡支持恢复**（打包内置 `libnccl.so.2`，`--split-mode layer/row/tensor` 恢复可用）+ selective pin（路由表驱动）+ GPU cache 预填充 + on-demand pin 主路径 + 专家页淘汰 v3.1 + 分层 pin + A3 cache 32768 槽 + 按领域动态换表（POST /moe-set-domain）+ per-slot 锁优化 + soft_resize / 保留热专家 v2（默认单表）+ 显存自适应主表 top-k + proxy 并发修复 + flywheel 表持久化。
+**一个二进制兼容所有 NVIDIA 显卡**——GTX 1080（sm_61）/ P100（sm_60）到 RTX 50 系（sm_120a），并从 bins-v0.8.0 起支持原生 Windows（`llama_bins_win.zip`）。CUDA 12.8 编译，无需按显卡单独编译，`moe-l2 download-bins` 自动拉取（PyPI 0.12.0 起按平台自动选 zip/tar.gz）。bins-v0.8.0 在 v0.7.0 引擎基础上新增 **sm_60 + sm_70**（P100 / V100 / Titan V）并附 **Windows zip**（llama-server.exe + DLLs，AVX2，内置 CUDA 12.8 runtime，驱动 ≥ 570）。v0.7.0 的功能全部继承：**IQ1_M 量化修复**（Qwen3.8-Flash-Next / Qwen4exp 125B 512 专家模型不再在 MMQ 崩溃——改走 MMVQ + 批上限拆分）+ **NCCL 多卡支持恢复**（打包内置 `libnccl.so.2`，`--split-mode layer/row/tensor` 恢复可用）+ selective pin（路由表驱动）+ GPU cache 预填充 + on-demand pin 主路径 + 专家页淘汰 v3.1 + 分层 pin + A3 cache 32768 槽 + 按领域动态换表（POST /moe-set-domain）+ per-slot 锁优化 + soft_resize / 保留热专家 v2（默认单表）+ 显存自适应主表 top-k + proxy 并发修复 + flywheel 表持久化。
 
 | GPU | 架构 | DS-V2-Lite | Qwen3.6-A3B | Qwen4exp 125B IQ1_M | 显存 |
 |-----|------|-----------|-------------|---------------------|------|
@@ -219,16 +219,29 @@ L3 ─ SSD 冷存储    GGUF 文件 mmap，冷专家页按需读入 + v3.1 淘�
 - `--port 11435`（默认）
 - `--gpu`：启用 GPU 模式（需要 CUDA + NVIDIA 显卡）
 
-> **GPU 二进制**：不在 git 中追踪（`llama_bins.tar.gz`，bins-v0.6.0 约 1.6 GB 多架构包，sm_61/75/86/89/120a 一个二进制兼容所有 NVIDIA 消费卡，含 cuda-libs），运行时通过 `moe-l2 download-bins` 获取。
+> **GPU 二进制**：不在 git 中追踪（Linux 为 `llama_bins.tar.gz`、Windows 为 `llama_bins_win.zip`，bins-v0.8.0 起多架构 sm_60/61/70/75/86/89/120a 一个包兼容全部 NVIDIA 卡含 P100/V100，含 cuda-libs / CUDA runtime DLL），运行时通过 `moe-l2 download-bins` 获取（PyPI 0.12.0 起按平台自动选择）。
 
 ---
 
 ## 平台要求
 
-- **仅 Linux x86_64** — 预编译二进制目标为 Linux AMD64（CUDA `.so` + `llama-server`）
-- macOS、Windows、ARM Linux **暂不支持**
+- **Linux x86_64 + NVIDIA 显卡** — 主平台（CUDA `.so` + `llama-server` 二进制包）
+- **Windows 10/11 x64 + NVIDIA 显卡** — bins-v0.8.0 起原生支持（`llama_bins_win.zip`：llama-server.exe + DLL 全家，与 Linux 同款 A3 专家缓存 / 路由表功能）
+- macOS、ARM Linux **暂不支持**
 - **强烈建议使用 NVMe 固态硬盘**
 - `--gpu` 模式需要 NVIDIA 显卡（CUDA 后端）
+
+### Windows 原生版（bins-v0.8.0+）
+
+正常安装 moe-l2 后拉取 Windows 引擎——`download-bins` 在 Windows 上会自动下载 `llama_bins_win.zip`：
+
+```
+pip install moe-l2
+moe-l2 download-bins
+moe-l2 start --model C:\models\Qwen3.6-35B-A3B-UD-IQ2_M.gguf --gpu
+```
+
+zip 内含 `llama-server.exe` + `llama-cli.exe` + 全部 DLL（多架构 cubin：sm_60/61/70/75/86/89/120a，AVX2，已含 CUDA 12.8 runtime DLL——无需安装 CUDA Toolkit，NVIDIA 驱动 ≥ 570 即可）。Windows 上生成领域路由表：`moe-l2 collect --model <你的.gguf>`（自动使用捆绑的 llama-cli.exe）。已在 RTX 3060 12G 实测（Qwen3.6-35B-A3B LRU 热缓存 ~21-22 t/s，与 Linux 同款引擎）。
 
 ---
 
