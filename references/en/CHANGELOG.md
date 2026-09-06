@@ -6,6 +6,18 @@ Format: Keep a Changelog 1.1 style — Added / Changed / Fixed.
 
 ---
 
+## [0.12.1] - 2026-09-06
+
+### Fixed
+- **`moe-l2 doctor` crash on Windows** — `_check_disk` used `os.statvfs()` (POSIX-only); Windows Python raised `AttributeError: module 'os' has no attribute 'statvfs'` → switched to `shutil.disk_usage()` (cross-platform).
+- **Windows startup timeout (180s ready window blown)** — llama-server child stdout/stderr went to a PIPE; Windows pipe buffering (~4KB default) blocked llama-server's writes and stalled model loading → redirected to `~/.moe-l2/llama-server.log` (append mode; log survives CLI crashes).
+- **TIMEOUT branch crash + orphan process** — `communicate(timeout=5)` waits for the process to exit, which always times out for a resident llama-server (`TimeoutExpired` uncaught → CLI died, kill never ran, engine left orphaned and kept loading) → now dumps log tail + `kill()` + `wait(timeout=10)`, no orphan left.
+
+### Verified
+- Linux full pytest 161 passed (coverage 51.00%), ruff clean, no regression. Windows fixes to be re-verified by the user on RTX 3060.
+
+---
+
 ## [0.12.0] - 2026-09-06
 
 ### Added

@@ -6,6 +6,18 @@ Format: Keep a Changelog 1.1 style — Added / Changed / Fixed.
 
 ---
 
+## [0.12.1] - 2026-09-06
+
+### Fixed
+- **`moe-l2 doctor` Windows 崩溃** — `_check_disk` 用 `os.statvfs()`（仅 POSIX 有），Windows Python 报 `AttributeError: module 'os' has no attribute 'statvfs'` → 改 `shutil.disk_usage()`（跨平台）。
+- **Windows 启动超时（180s 就绪窗口被拖爆）** — llama-server 子进程 stdout/stderr 走 PIPE；Windows 管道缓冲默认 ~4KB，加载日志写满即写阻塞、反拖慢模型加载 → 改重定向到 `~/.moe-l2/llama-server.log`（追加模式），CLI 崩溃后日志仍可读。
+- **TIMEOUT 分支 cli 崩溃 + 孤儿进程** — `communicate(timeout=5)` 语义是等进程退出，对常驻 llama-server 必抛 `TimeoutExpired`（未捕获 → cli 死、kill 未执行、引擎成孤儿继续加载）→ 改打印日志尾部 + `kill()` + `wait(timeout=10)` 收尸，不再留孤儿。
+
+### Verified
+- Linux 全量 pytest 161 passed（coverage 51.00%），ruff 零错误，无回归。Windows 修复由用户在 RTX 3060 复测。
+
+---
+
 ## [0.12.0] - 2026-09-06
 
 ### Added

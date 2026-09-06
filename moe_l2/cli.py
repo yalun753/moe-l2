@@ -13,6 +13,7 @@ Usage:
 import argparse
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -57,6 +58,9 @@ _BUNDLE_DIR = Path(__file__).resolve().parent / "bin"
 _LLAMA_SERVER_PATH = _BUNDLE_DIR / _LLAMA_SERVER_NAME
 _LLAMA_CLI_PATH = _BUNDLE_DIR / _LLAMA_CLI_NAME
 _GPU_PORT = 11436  # llama-server listens here; proxy forwards to it
+# llama-server log file (stdout/stderr redirected here instead of a PIPE —
+# an unread PIPE fills up on Windows (4KB buffer) and stalls model loading)
+_LLAMA_SERVER_LOG = Path.home() / ".moe-l2" / "llama-server.log"
 
 # Model catalog for `moe-l2 model download` (hf-mirror.com mirrors HuggingFace)
 # name -> (repo_id, [files])  — files are relative to repo root
@@ -290,12 +294,24 @@ def _start_llama_server(
         cmd += ["--parallel", str(n_parallel)]
 
     logger.info("Launching llama-server (A3 GPU): %s", " ".join(cmd))
+    # Redirect child output to a log file instead of a PIPE. An unread PIPE
+    # fills up (Windows default ~4KB) and blocks llama-server's writes, stalling
+    # model loading until the CLI reads — classic hang on slow/first load.
+    # Log file also survives CLI crashes, so the TIMEOUT branch can dump it.
+    logf = None
+    try:
+        _LLAMA_SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
+        logf = open(_LLAMA_SERVER_LOG, "ab", buffering=0)
+    except OSError:
+        pass
     proc = subprocess.Popen(
         cmd,
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=logf if logf is not None else subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
     )
+    if logf is not None:
+        logf.close()  # child keeps the inherited handle
     return proc
 
 
@@ -640,13 +656,13 @@ def _check_python() -> tuple[bool, str]:
 
 
 def _check_disk(path: Path) -> tuple[bool, str]:
-    # statvfs needs an existing dir; walk up to nearest ancestor
+    # disk_usage() is cross-platform; os.statvfs() is POSIX-only and crashes
+    # on Windows (AttributeError in `moe-l2 doctor`, 2026-09-06 Windows 实测).
     p = path
     while p and not p.exists():
         p = p.parent
     try:
-        st = os.statvfs(str(p))
-        free_gb = (st.f_bavail * st.f_frsize) / (1024**3)
+        free_gb = shutil.disk_usage(str(p)).free / (1024**3)
         if free_gb >= 5:
             return True, f"{free_gb:.1f} GB free (for {path})"
         return False, f"only {free_gb:.1f} GB free (for {path}, need >=5GB)"
@@ -957,10 +973,20 @@ def cmd_start(args):
         ready = _wait_for_llama_server(_GPU_PORT)
         if not ready:
             print("TIMEOUT")
-            stdout, stderr = llama_proc.communicate(timeout=5)
-            print("  stdout:", stdout.decode(errors="replace")[-500:])
-            print("  stderr:", stderr.decode(errors="replace")[-500:])
+            # llama-server is a long-running daemon that never exits on its own —
+            # communicate() would block forever and TimeoutExpired crashed the CLI
+            # (Windows 实测 2026-09-06, leaving llama-server as an orphan that kept
+            # loading). Dump the log file tail instead, then kill.
+            try:
+                tail = _LLAMA_SERVER_LOG.read_text(errors="replace")[-800:]
+                print("  server log tail:\n" + tail)
+            except OSError:
+                print("  (no server log available)")
             llama_proc.kill()
+            try:
+                llama_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
             return 1
         print("READY")
         print(f"  backend:  127.0.0.1:{_GPU_PORT} (llama-server + CUDA + A3)")
