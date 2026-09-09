@@ -6,6 +6,16 @@ Format: Keep a Changelog 1.1 style — Added / Changed / Fixed.
 
 ---
 
+## [0.13.0] - 2026-09-09
+
+### Added
+- **`moe-l2 start --ctx-force`** — 显式指定 `--ctx-size` 时跳过 vram_adaptive 自动降档（完全信任用户）。背景：KV 估算公式对无 `head_dim` 字段的 qwen35moe（Qwen3.6-35B-A3B）高估约 16 倍（估 320KB/tok，实测 ~20KB/tok），12G 卡上 `--ctx-size 32768/262144` 都会被压到降档序列上限 8192；引擎实测 256K 全程 KV 仅 ~5.4GB 放得下。默认行为不变（未加 --ctx-force 仍自动保护防 OOM）。用法：`moe-l2 start --model X.gguf --gpu --ctx-size 262144 --ctx-force`。改动文件：moe_l2/vram_adaptive.py（`compute_safe_params(force_ctx=...)`）、moe_l2/cli.py（`_start_llama_server(ctx_force)` + start 子命令参数）。备份：`moe_l2/*.bak-20260909-ctxfix`。
+
+### Verified
+- 本地单测：force + 262144 → 保持 262144；无 force + 262144 → 8192（原行为回归）；无 force + 16384 → 16384（原行为回归）；`start --help` 正确注册 `--ctx-force`；模块 import 无语法错。
+
+---
+
 ## [0.12.1] - 2026-09-06
 
 ### Fixed

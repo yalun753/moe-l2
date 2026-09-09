@@ -175,6 +175,7 @@ def compute_safe_params(
     vram_free_mb: int | None = None,
     want_ctx: int = 8192,
     want_parallel: int = 1,
+    force_ctx: bool = False,
 ) -> dict:
     """根据显存算 safe (n_ctx, n_parallel, kv_budget_gb, reason)。
 
@@ -183,7 +184,18 @@ def compute_safe_params(
       n_parallel: int     并行度（先保 1；富余时给 want_parallel）
       kv_budget_gb: float KV 可用预算
       reason: str         降档说明（"OK" 或 "OOM 风险，自动降档：..."）
+
+    force_ctx=True → 显式指定优先（--ctx-force），完全信任 want_ctx，
+    跳过自动降档。用于用户明确知道显存放得下的场景（如 Qwen3.6-35B-A3B
+    IQ2_M 实测 256K KV 仅 ~5.4GB，12G 卡放得下；而估算公式对无 head_dim
+    字段的 qwen35moe 高估 16 倍会误降档到 8192，2026-09-09 校准）。
     """
+    if force_ctx:
+        return {"n_ctx": want_ctx,
+                "n_parallel": want_parallel if want_parallel > 1 else 1,
+                "kv_budget_gb": 0.0,
+                "reason": "OK (ctx-force: 显式指定，跳过自动降档)"}
+
     total_mb, free_mb = probe_vram_mb()
     if vram_total_mb is not None:
         total_mb = vram_total_mb

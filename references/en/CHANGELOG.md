@@ -6,6 +6,16 @@ Format: Keep a Changelog 1.1 style — Added / Changed / Fixed.
 
 ---
 
+## [0.13.0] - 2026-09-09
+
+### Added
+- **`moe-l2 start --ctx-force`** — trust an explicit `--ctx-size` and skip the vram_adaptive auto-downgrade. Background: the KV estimator over-estimates head_dim-less qwen35moe (Qwen3.6-35B-A3B) ~16x (320KB/tok estimated vs ~20KB/tok measured), so `--ctx-size 32768/262144` on a 12G card was clamped to the top downgrade level (8192) even though the engine fits 256K (~5.4GB KV). Default behaviour unchanged (still auto-protects against OOM). Usage: `moe-l2 start --model X.gguf --gpu --ctx-size 262144 --ctx-force`. Files: moe_l2/vram_adaptive.py (`compute_safe_params(force_ctx=...)`), moe_l2/cli.py (`_start_llama_server(ctx_force)` + start flag). Backup: `moe_l2/*.bak-20260909-ctxfix`.
+
+### Verified
+- Unit: force + 262144 → kept; no-force + 262144 → 8192 (downgrade preserved); no-force + 16384 → 16384; `start --help` registers `--ctx-force`; live on RTX 3060 12G: moe-l2 line starts with `n_ctx_slot = 262144` (llama-server log), full-chain chat OK via proxy.
+
+---
+
 ## [0.12.1] - 2026-09-06
 
 ### Fixed

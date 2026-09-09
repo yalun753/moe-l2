@@ -206,6 +206,7 @@ def _start_llama_server(
     router_top_k: int = 100,
     n_ctx: int | None = None,
     n_parallel: int | None = None,
+    ctx_force: bool = False,
 ) -> subprocess.Popen:
     """Launch bundled llama-server with GPU support (A3 patch enabled).
 
@@ -215,6 +216,8 @@ def _start_llama_server(
     When router_map is None, no selective pin (whole-pin default).
     n_ctx/n_parallel: 显式指定则用；None 时启动前探测显存自动算 safe 值
     （防 KV 预分配 OOM 崩溃，2026-08-15 vram_adaptive）。
+    ctx_force: --ctx-force，显式指定 n_ctx 时跳过 vram_adaptive 自动降档
+    （2026-09-09，信任用户明确知道显存放得下的场景）。
     """
     if not _LLAMA_SERVER_PATH.exists():
         raise FileNotFoundError(
@@ -279,6 +282,7 @@ def _start_llama_server(
             model_path,
             want_ctx=n_ctx or 8192,
             want_parallel=n_parallel or 1,
+            force_ctx=ctx_force,
         )
         n_ctx = params["n_ctx"]
         n_parallel = params["n_parallel"]
@@ -476,6 +480,16 @@ def main():
         help=(
             "[moe-l2 2026-08-15] Context size (default: 8192). Auto-downgraded "
             "when VRAM is insufficient (see --parallel)."
+        ),
+    )
+    start_parser.add_argument(
+        "--ctx-force",
+        action="store_true",
+        help=(
+            "[moe-l2 2026-09-09] Trust an explicit --ctx-size and SKIP the VRAM "
+            "auto-downgrade. Use when you know the card fits (e.g. Qwen3.6-35B-"
+            "A3B IQ2_M fits -c 262144 on a 12G card; the KV estimator over-"
+            "estimates qwen35moe ~16x and would otherwise clamp to 8192)."
         ),
     )
 
@@ -963,6 +977,7 @@ def cmd_start(args):
                 router_top_k,
                 n_ctx=getattr(args, "ctx_size", None),
                 n_parallel=getattr(args, "parallel", None),
+                ctx_force=getattr(args, "ctx_force", False),
             )
         except FileNotFoundError as e:
             print(f"  ERROR: {e}")

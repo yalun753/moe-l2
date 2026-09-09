@@ -93,3 +93,24 @@ def test_mla_arch_detection():
     assert va._arch_is_mla({"general.architecture": "DeepSeek-V3"})
     assert not va._arch_is_mla({"general.architecture": "qwen35moe"})
     assert not va._arch_is_mla({})
+
+
+def test_ctx_force_keeps_large_ctx(monkeypatch):
+    """--ctx-force（force_ctx=True）：即使 KV 估算会触发降档，也完全信任 want_ctx。"""
+    monkeypatch.setattr(va, "probe_vram_mb", lambda: (12288, 12288))
+    # qwen35moe 高估场景：12G 卡 262144 本会被降档序列压到 8192
+    monkeypatch.setattr(va, "estimate_kv_bytes_per_token", lambda p: 327680.0)
+
+    r = va.compute_safe_params("/qwen35moe.gguf", want_ctx=262144, force_ctx=True)
+    assert r["n_ctx"] == 262144
+    assert "ctx-force" in r["reason"]
+
+
+def test_ctx_force_default_off_preserves_downgrade(monkeypatch):
+    """默认（force_ctx=False）行为不变：大 ctx 仍自动降档（防 OOM 保护）。"""
+    monkeypatch.setattr(va, "probe_vram_mb", lambda: (12288, 12288))
+    monkeypatch.setattr(va, "estimate_kv_bytes_per_token", lambda p: 327680.0)
+
+    r = va.compute_safe_params("/qwen35moe.gguf", want_ctx=262144)
+    assert r["n_ctx"] == 8192  # 降档序列最高档
+    assert "降档" in r["reason"]
