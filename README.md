@@ -16,7 +16,7 @@
 |----------|--------------|-----------------|-------------------------------|
 | 10-11 GB | — | DeepSeek-V2-Lite (16B MoE) ✅ | **139-154 t/s** |
 | **10-11 GB** | 7B dense | **Qwen3.6-A3B (32B MoE) ✅** | **25.5-44.2 t/s** |
-| 10-11 GB | — | **DeepSeek-V4-Flash (157B MoE, 85 GB file) ⚠️** | **N/A — upstream llama.cpp deepseek4 CUDA expert bug ([#25582](https://github.com/ggml-org/llama.cpp/issues/25582))** |
+| 10-11 GB | — | **DeepSeek-V4-Flash (157B MoE, 85 GB file) ⚠️** | **N/A — upstream llama.cpp deepseek4 CUDA expert bug ([#25582](https://github.com/ggml-org/llama.cpp/issues/25582), auto-closed as stale 2026-09-05 without a fix)** |
 | 24 GB | — | **Qwen3-235B-A22B (235B MoE, 85.7 GB file) ✅** | **~3.9 t/s** |
 
 > Speed = RTX 4090 measured (2026-08-19, bins-v0.6.0 per-slot-lock build, full-chain `moe-l2 start --gpu`): DS-V2-Lite 139-154 t/s (single-turn 141, long-context 139), Qwen3.6-A3B 25.5-44.2 t/s (mixed-domain). 2080 Ti full-chain (v0.6.0): Qwen 16.6-28.6 t/s, DS-V2-Lite 86-94 t/s. **5090 (SM120a, v0.6.0): Qwen 28-52.5 t/s, DS 141-151 t/s**. Qwen3-235B-A22B: ~3.9 t/s steady (2026-08-11). See [models-benchmark.md](references/en/models-benchmark.md).
@@ -116,7 +116,7 @@ Since PyPI 0.13.1 context is auto-sized: leave `--ctx-size` out and the CLI targ
 | DS-V2-Lite (2080 Ti) | 78.3 t/s | **198.59** total | **188.25** total | 2.4-2.5× |
 | DeepSeek-V4-Flash (4090) ⚠️ | 35.4-35.8 t/s | **89.66** total | **88.10** total | 2.5× |
 
-> ⚠️ V4 行速度 N/A — 上游 deepseek4 CUDA 专家路径 bug（#25582）。
+> ⚠️ V4 行速度 N/A — 上游 deepseek4 CUDA 专家路径 bug（#25582；该 issue 于 2026-09-05 被 stale bot 自动关闭、**没有修复**，上游 DSV4 CUDA 工作仍在推进：#26490 `-sm tensor`、#27970 sparse-fa 已合并）。
 
 Concurrent throughput = **2.3-2.5× a single session**; cross-domain vs same-domain is only **-5-7%** — no per-domain cache pools needed. VRAM grows only by the per-slot KV cache (+2.9 GB for 4 slots), RAM stays flat (+0.2 GB). **One AI PC can serve multiple users at once.** Full report: [concurrent-cache-sharing-20260812.md](references/en/concurrent-cache-sharing-20260812.md)
 
