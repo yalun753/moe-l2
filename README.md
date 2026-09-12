@@ -87,6 +87,25 @@ Measured on RTX 3060 12G, Qwen3.6-35B-A3B **UD-IQ2_M** (11.5 GB file), released 
 
 Since PyPI 0.13.1 `--ctx-size` is optional: the CLI targets the model's native context (`context_length` from the GGUF) and narrows it to what VRAM safely fits, so this model auto-lands on **262144** on a 12G card without any tuning. 45K-token needle retrieval passed at every ctx from 64K to 384K with no degradation (long *summarization* on UD-quantized files is a separate, known weak spot of the file itself — not a ctx limit). UD-**Q4_K_M** (22.1 GB file) on the same card caps at **128K** (13-16 t/s, 7963 MiB): its non-expert layers occupy ~1.9 GB more VRAM, leaving less for KV.
 
+### Which card fits which model (measured, same machine)
+
+| Card | Model / quant | Max ctx | Speed (short prompt) | VRAM at max ctx |
+|------|---------------|---------|----------------------|-----------------|
+| **12 GB** (RTX 3060) | Qwen3.6-35B-A3B **UD-IQ2_M** (11.5 GB) | **262144** (sweet spot) / **393216** (ceiling) | 25.0-25.3 t/s @256K · 22.7-22.9 t/s @384K · 28.3-29.0 t/s @128K | 8700 MiB @256K · 11358 MiB @384K |
+| **12 GB** | Qwen3.6-35B-A3B **UD-Q4_K_M** (22.1 GB) | **131072** | 13-16 t/s | 7963 MiB |
+| **8 GB** | Qwen3.6-A3B class (IQ2) | depends on quant — start lower | ~11-17 t/s (expert-cache hit rate 65-76%) | — |
+
+Since PyPI 0.13.1 context is auto-sized: leave `--ctx-size` out and the CLI targets the model's native context, narrowed to what the VRAM budget safely fits (no OOM). Quantization matters as much as ctx: on a 12 GB card the IQ2-class file reaches 256K while Q4 caps at 128K — the difference is non-expert weights competing with the KV budget.
+
+### Long documents — first read vs repeat read (RTX 3060 12G, 2026-09-09)
+
+| Scenario | Wall time (45K-token document) |
+|----------|-------------------------------|
+| **First** read (cold prefill, ≈550 tok/s prefill) | 80-200 s |
+| **Repeat** read (prompt cache hit) | 85-96 s of generation, prefill ≈ free |
+
+45K-token needle retrieval passed at every ctx from 64K to 384K, and quality does not degrade on repeated reads — so if you ask several follow-up questions about one long document, keep them in the same session: the document is prefilled once and reused. Starting a fresh session for each question re-pays the prefill.
+
 ### Concurrent requests — shared cache, no speed loss (2026-08-12)
 
 4 parallel slots share one A3 expert cache / selective-pin table — verified on 2080 Ti and 4090 with **Qwen3.6-35B-A3B**, **DS-V2-Lite** and **DeepSeek-V4-Flash (256 experts, spread routing)**:
@@ -339,6 +358,13 @@ AirLLM is a general-purpose layer-offload scheme for very large models. Its sche
 | Multi-shard GGUF | No specific support | **Fixed multi-shard metadata parsing, 85GB 3-shard V4 stable** |
 
 **Which to choose**: pick moe-l2 if you run MoE models (DeepSeek/Qwen) locally for chat, have an 8–12GB older NVIDIA card, want an OpenAI API for tooling, or use multi-shard giant GGUFs. Pick AirLLM if you need dense (non-MoE) models, use Windows/macOS/AMD or CPU-only environments (moe-l2 currently requires Linux + NVIDIA), only do one-shot batch generation, or must stay with native HF weights.
+
+## Known issues & tips
+
+- **Long-form summarization on UD-quantized files** (Unsloth Dynamic, e.g. `*-UD-IQ2_M`, `*-UD-Q4_K_M`): byte-level inspection of the GGUF shows corrupted L0 expert weights (IQ2_M: 32.2% zeros in `blk.0.ffn_gate_exps`, 36.4% in `ffn_up_exps`; Q4_K_M: 13.8%; other layers only 1-2%). At `temperature ≥ 1.0` this shows up as probabilistic degradation on **long summarization** (measured 6-round bad rate on a 45K-token document: Q4 4/6, IQ2 2/6). Needle retrieval is unaffected: at `temperature 0.7` it passed at 64K-384K on the same files. **Tips**: keep `temperature` at 0.7-0.8 for long inputs (all examples here use 0.7); if you need high-temperature long-form generation, a non-UD quant is the current best guess corner to test (verification pending — see the issue tracker if you have results).
+- **UD files are the only files with this signature so far**: the same behaviour appears on vanilla `llama-server` with no moe-l2 involved, so it is a file-side property, not an engine bug.
+- **Give long documents one warm-up**: the first read of a 45K-token document costs the prefill (80-200 s on a 3060); follow-up questions in the same session reuse it.
+- **Windows native (bins-v0.8.0+)**: console encoding is handled since PyPI 0.13.1 (previously `moe-l2 start` could crash on a GBK console when printing symbols). CUDA runtime requires driver ≥ 570.
 
 ## Testing
 
