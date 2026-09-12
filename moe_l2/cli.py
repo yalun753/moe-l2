@@ -216,6 +216,7 @@ def _start_llama_server(
     When router_map is None, no selective pin (whole-pin default).
     n_ctx/n_parallel: 显式指定则用；None 时启动前探测显存自动算 safe 值
     （防 KV 预分配 OOM 崩溃，2026-08-15 vram_adaptive）。
+    n_ctx=None → ctx 自动档 = 模型原生上限按显存预算收敛（2026-09-12）。
     ctx_force: --ctx-force，显式指定 n_ctx 时跳过 vram_adaptive 自动降档
     （2026-09-09，信任用户明确知道显存放得下的场景）。
     """
@@ -272,21 +273,22 @@ def _start_llama_server(
         "-ngl", "99",       # offload non-expert layers to GPU
     ]
 
-    # [moe-l2 2026-08-15 显存自适应] KV 预分配按 parallel × n_ctx，显存不足直接
-    # cudaMalloc 崩溃（Qwen cache + parallel 4 在 11GB 卡 OOM 实测）。启动前
-    # 探测显存 + 按模型 KV 估算自动降档。显式传入的 n_ctx/n_parallel 作为
-    # "期望值"，显存不够时仍会降档（想要 4 路但放不下 → 自动降到能跑的）。
+    # [moe-l2 2026-08-15 显存自适应 / 2026-09-12 自动档] KV 预分配按 parallel × n_ctx，
+    # 显存不足直接 cudaMalloc 崩溃（Qwen cache + parallel 4 在 11GB 卡 OOM 实测）。
+    # 启动前探测显存 + 按模型 KV 估算自动降档：
+    #   未指定 --ctx-size → ctx 自动档 = 模型原生上限，按显存预算收敛（用户不用懂参数）
+    #   显式指定 → 作为"期望值"，显存不够仍会降档（--ctx-force 可跳过）
     try:
         from moe_l2.vram_adaptive import compute_safe_params
         params = compute_safe_params(
             model_path,
-            want_ctx=n_ctx or 8192,
+            want_ctx=n_ctx,
             want_parallel=n_parallel or 1,
             force_ctx=ctx_force,
         )
         n_ctx = params["n_ctx"]
         n_parallel = params["n_parallel"]
-        if params["reason"] != "OK":
+        if params.get("auto") or params["reason"] != "OK":
             print(f"  [vram-adaptive] {params['reason']}")
     except Exception as e:  # 自适应失败不阻塞启动，用默认
         print(f"  [vram-adaptive] ⚠️ 自动降档失败，用默认 c8192/parallel1：{e}")
@@ -374,6 +376,11 @@ def _wait_for_llama_server(port: int, timeout: float = 180.0) -> bool:
 
 
 def main():
+    # Windows GBK 控制台兜底：print 里的 ⚠️/✅/→ 等字符放不下时会崩掉整条命令
+    # （210 实测 router_table 打警告时 start 直接挂），入口处把 errors 改成 replace
+    from moe_l2.console import enable_safe_console
+
+    enable_safe_console()
     parser = argparse.ArgumentParser(
         prog="moe-l2",
         description="MoE inference L2 hot-cache scheduler",
@@ -476,10 +483,13 @@ def main():
     start_parser.add_argument(
         "--ctx-size",
         type=int,
-        default=8192,
+        default=None,
         help=(
-            "[moe-l2 2026-08-15] Context size (default: 8192). Auto-downgraded "
-            "when VRAM is insufficient (see --parallel)."
+            "[moe-l2 2026-09-12] Context size. Omit → AUTO: the model's native "
+            "context (GGUF context_length, capped at 262144) narrowed to what VRAM "
+            "safely fits — e.g. Qwen3.6-35B-A3B IQ2_M auto-lands on 262144 on a 12G "
+            "card. An explicit value is still auto-downgraded when VRAM is "
+            "insufficient (see --parallel); use --ctx-force to bypass."
         ),
     )
     start_parser.add_argument(
@@ -487,9 +497,10 @@ def main():
         action="store_true",
         help=(
             "[moe-l2 2026-09-09] Trust an explicit --ctx-size and SKIP the VRAM "
-            "auto-downgrade. Use when you know the card fits (e.g. Qwen3.6-35B-"
-            "A3B IQ2_M fits -c 262144 on a 12G card; the KV estimator over-"
-            "estimates qwen35moe ~16x and would otherwise clamp to 8192)."
+            "auto-downgrade. Usually unnecessary since 2026-09-12 (KV estimator "
+            "fixed: hybrid-attention models like qwen35moe were over-estimated ~16x, "
+            "which clamped 262144 back to 8192); keep it for models/setups the "
+            "estimator cannot size."
         ),
     )
 
@@ -970,6 +981,9 @@ def cmd_start(args):
                     data_dir=data_dir,
                     coverage_target=getattr(args, "coverage_target", 0.90),
                 )
+            if getattr(args, "ctx_force", False) and getattr(args, "ctx_size", None) is None:
+                print("  [ctx-force] --ctx-force 不带 --ctx-size 时无意义"
+                      "（跳过的是显式值的降档）；已按自动档启动。")
             llama_proc = _start_llama_server(
                 model_path,
                 _GPU_PORT,

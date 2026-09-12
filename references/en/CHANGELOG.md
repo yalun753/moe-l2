@@ -6,6 +6,22 @@ Format: Keep a Changelog 1.1 style — Added / Changed / Fixed.
 
 ---
 
+## [0.13.1] - 2026-09-12
+
+### Fixed
+- **Default ctx is now AUTO instead of a hard-coded 8192** — `moe-l2 start` without `--ctx-size` targets the model's native context (`context_length` from GGUF, capped at 262144) and narrows it to what VRAM safely fits. An explicit `--ctx-size N` is still treated as a wish that gets downgraded when needed; `--ctx-force` remains the explicit opt-out (and now warns when used without `--ctx-size`). Measured on 210 (RTX 3060 12G + Qwen3.6-35B-A3B UD-IQ2_M): the same start command gave the engine `-c 8192` before and `-c 262144` after (`/props` confirms `n_ctx=262144`, VRAM 9392/12288 MiB, health ok, real inference clean).
+- **KV estimator over-estimated hybrid-attention models ~16x** — the old formula used `block_count` × `embedding/head_count` (40 x 128 = 327,680 B/tok). qwen35moe only keeps KV on 10 of its 40 layers (`full_attention_interval=4`; the rest are SSM/linear layers) and its head dim is `key_length/value_length=256`, not 2048/16=128. The new formula counts layers that actually carry `blk.N.attn_k/attn_v` tensors and uses the declared key/value lengths: 20,480 B/tok, x1.15 safety = 23,552 B/tok, matching the measured 20.3-20.8 KB/tok slope (VRAM 4966 -> 11358 MiB from ctx 64K -> 384K, see `测试记录-moe-l2-IQ2速度与最大上下文-210-20260909.md`).
+- **Downgrade ladder was missing 16384/32768** — the old ladder `[8192, 4096, 2048, 1024, 512, 256]` jumped straight back to 8192 when 32768 did not fit; it now includes `262144 / 131072 / 65536 / 32768 / 16384` and picks the nearest level that fits.
+- **Fixed VRAM overhead is now measured per model** — non-expert weight bytes are summed from the GGUF tensor table (Q4 non-expert layers are much larger than IQ2) instead of a flat 2.5 GB constant; falls back to 2.0 GB when the tensor table cannot be read. The A3 expert-cache reserve in the budget moved from 30% to 25% (calibrated against the measured 210 numbers).
+- **`print` of non-ASCII symbols crashed the whole command on a GBK console (Chinese Windows)** — ⚠️/✅/❌/→ raise `UnicodeEncodeError` when the console codec is cp936: on 210 `moe-l2 start` died inside `router_table.py` while printing "⚠️ no router table and no llama-cli, skipping selective pin", so the service never came up (the daily .bat sets `PYTHONIOENCODING=utf-8`, which is why it had stayed hidden). Fix: new `moe_l2/console.py` with `enable_safe_console()`, called at the CLI entry point and when `moe_l2.collect` runs standalone — it switches stdout/stderr `errors` to `replace` (encoding untouched, so Chinese still prints; unrepresentable symbols degrade to `?`), covering 180+ similar prints in one place.
+
+### Verified
+- Local: `pytest tests/` **176 passed** (18 new cases in `tests/test_vram_adaptive.py`, including writing a real GGUF and reading it back to validate the layer counting and non-expert byte accounting; 4 new cases in `tests/test_console.py` covering the "GBK console crashes on ⚠️ -> survives once the guard is enabled" before/after), coverage **55.96%** (was 51.06%), `ruff check moe_l2/ tests/` clean.
+- On 210 (RTX 3060 12G / Windows / D:\models\Qwen3.6-35B-A3B-UD-IQ2_M.gguf): facts read 40 layers / 10 KV-carrying layers / `context_length=262144` / 1.625 GiB non-expert; auto ctx 262144 loaded with no OOM, `/props` n_ctx=262144, two real inferences returned clean output (one with 2260 chars of reasoning, 659 tokens, stop).
+- Before/after (same command, model and machine): `kv_per_token` 327,680 -> 23,552; default ctx 8192 -> 262144; explicit `--ctx-size 262144` went from "clamped back to 8192" to "kept at 262144"; top ladder level 8192 -> 262144.
+
+---
+
 ## [0.13.0] - 2026-09-09
 
 ### Added

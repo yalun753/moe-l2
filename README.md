@@ -73,6 +73,20 @@ One binary for **all NVIDIA GPUs** — GTX 1080 (sm_61) / P100 (sm_60) through R
 
 \* Rows = full-chain measured (`moe-l2 start --gpu`, per-domain table switch + A3 cache, default single-table). **bins-v0.7.0 (2026-08-28)**: 4090 — Qwen4exp 125B IQ1_M **19.8 t/s** (cache hit 97.3%, 32768 slots), Qwen3.6 **56.3 t/s** (round 3, +17-28% vs v0.6.0's 44-48), DS-V2-Lite **143.5 t/s** (+8%); 2080 Ti — Qwen3.6 **40.3 t/s** (hit 95.1%). Older rows: 4090 v0.6.0 Qwen 25.5-44.2 (mixed-domain) / DS 139-154; 2080 Ti v0.6.0 Qwen 16.6-28.6 / DS 86-94; 5090 v0.6.0 Qwen 28-52.5 / DS 141-151; 3080 Ti v3.1 multi-arch (bins-v0.3.0). All outputs verified clean (no garbage). **Qwen4exp 125B** — 512 experts/layer, IQ1_M: previously crashed (`GGML_ABORT` in MMQ quantize, no support for IQ1_M); fixed by routing to MMVQ + batch-cap split. 3-model 4090 log: `测试数据备份/4090-bins-v070-verify-20260828/`.
 
+### Context capability — 12G card, auto-sized (2026-09-09)
+
+Measured on RTX 3060 12G, Qwen3.6-35B-A3B **UD-IQ2_M** (11.5 GB file), released engine (A3 expert cache), full-chain `moe-l2 start --gpu` — same machine, same day:
+
+| ctx | VRAM at startup | Gen speed (short prompt) | 45K-token needle retrieval |
+|-----|-----------------|--------------------------|----------------------------|
+| 65536 | 4966 MiB | — | ✅ |
+| 131072 | 6104 MiB | **28.3-29.0 t/s** | ✅ |
+| **262144** (model native) | **8700 MiB** | **25.0-25.3 t/s** | ✅ |
+| 393216 | 11358 MiB | 22.7-22.9 t/s | ✅ |
+| 524288 | ~13.9 GB — does not fit a 12G card | — | — |
+
+Since PyPI 0.13.1 `--ctx-size` is optional: the CLI targets the model's native context (`context_length` from the GGUF) and narrows it to what VRAM safely fits, so this model auto-lands on **262144** on a 12G card without any tuning. 45K-token needle retrieval passed at every ctx from 64K to 384K with no degradation (long *summarization* on UD-quantized files is a separate, known weak spot of the file itself — not a ctx limit). UD-**Q4_K_M** (22.1 GB file) on the same card caps at **128K** (13-16 t/s, 7963 MiB): its non-expert layers occupy ~1.9 GB more VRAM, leaving less for KV.
+
 ### Concurrent requests — shared cache, no speed loss (2026-08-12)
 
 4 parallel slots share one A3 expert cache / selective-pin table — verified on 2080 Ti and 4090 with **Qwen3.6-35B-A3B**, **DS-V2-Lite** and **DeepSeek-V4-Flash (256 experts, spread routing)**:

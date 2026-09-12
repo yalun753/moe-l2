@@ -6,6 +6,24 @@ Format: Keep a Changelog 1.1 style — Added / Changed / Fixed.
 
 ---
 
+## [0.13.1] - 2026-09-12
+
+### Fixed
+- **ctx 默认从 8192 改为自动档（模型原生上限按显存收敛）** — `moe-l2 start` 不传 `--ctx-size` 时不再固定 8192，而是取 GGUF `context_length`（上限 262144）作为目标、按显存预算逐档收敛；显式 `--ctx-size N` 仍作为"期望值"参与降档，`--ctx-force` 保留为跳过降档的显式开关（不带 `--ctx-size` 时会提示其无意义）。210 实测（RTX 3060 12G + Qwen3.6-35B-A3B UD-IQ2_M）：同一条启动命令，旧版引擎收到 `-c 8192`，新版收到 `-c 262144`（引擎 `/props` 实锤 `n_ctx=262144`，显存 9392/12288 MiB，health ok，真实推理输出正常）。
+- **KV 估算对混合注意力模型高估 16 倍** — 旧公式按 `block_count` × `embedding/head_count` 估算，即 40 层 × 128 = 327,680 B/tok；实际 qwen35moe 的 40 层里只有 10 层是真注意力（`full_attention_interval=4`，其余是 SSM/线性层），head 维度是 `key_length/value_length=256` 而非 2048/16=128。新公式按"含 `blk.N.attn_k/attn_v` 张量的层数 × `head_count_kv` × (`key_length`+`value_length`) × 2(F16)" = 20,480 B/tok，乘安全系数 1.15 → 23,552 B/tok，与 210 实测斜率 20.3-20.8 KB/tok 对齐（ctx 64K→384K 显存 4966→11358 MiB 实测，见 `测试记录-moe-l2-IQ2速度与最大上下文-210-20260909.md`）。
+- **降档档位表缺 16384/32768** — 旧表 `[8192, 4096, 2048, 1024, 512, 256]`，放不下 32768 时会直接跳回 8192；新表补齐 `262144 / 131072 / 65536 / 32768 / 16384` 后按最接近的可放下档位收敛。
+- **固定显存开销改为按模型实测** — 非专家权重体积改从 GGUF 张量表求和（不同量化的非专家层差别很大，Q4 明显大于 IQ2），不再用固定 2.5GB 常量；读不到张量表时兜底 2.0GB。预算里给 A3 专家 cache 的预留从 30% 调到 25%（按 210 实测开销校准）。
+- **中文 Windows（GBK 控制台）下 `print` 非 ASCII 符号直接崩掉整条命令** — stdio 里出现 GBK 无法表示的字符（⚠️/✅/❌/→）时抛 `UnicodeEncodeError`：210 实测 `moe-l2 start` 在 `router_table.py` 打 "⚠️ 无路由表且无 llama-cli，跳过 selective pin" 时整条命令挂掉、服务起不来（日常 bat 设了 `PYTHONIOENCODING=utf-8` 所以没暴露，普通 Windows 用户直接跑必踩）。修法：新增 `moe_l2/console.py` 的 `enable_safe_console()`，在 CLI 入口和 `moe_l2.collect` 直接运行时把 stdout/stderr 的 errors 改成 `replace`——编码不动（中文照常显示），放不下的符号降级成 `?`；一处生效覆盖全仓 180+ 处同类 print。
+
+### Verified
+- 本地：`pytest tests/` **176 passed**（新增 18 个 `tests/test_vram_adaptive.py` 用例，含真写一个 GGUF 再读回、验证混合注意力层数统计与非专家体积的口径；新增 4 个 `tests/test_console.py` 用例，含"GBK 控制台打 ⚠️ 必崩 → 装兜底后不崩"的前后对照），coverage **55.96%**（改前 51.06%），`ruff check moe_l2/ tests/` clean。
+- 210 实机（RTX 3060 12G / Windows / D:\models\Qwen3.6-35B-A3B-UD-IQ2_M.gguf）：`_model_facts` 读出 40 层 / 10 层持 KV / `context_length=262144` / 非专家 1.625 GiB；自动档 262144 起服无 OOM，`/props` n_ctx=262144，两次真实推理输出正常（其中一次含 2260 字符思考、659 tok 正常收尾）。
+- 前后对比（同一命令、同一模型、同一台机器）：`kv_per_token` 327,680 → 23,552；默认档 8192 → 262144；显式 `--ctx-size 262144` 由"被压回 8192"变为"保持 262144"；档位表最高档 8192 → 262144。
+
+---
+
+
+
 ## [0.13.0] - 2026-09-09
 
 ### Added

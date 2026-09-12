@@ -18,6 +18,22 @@
 \* Mixtral figures are from the bare llama-server cache-benefit test (experts computed on CPU, not the host-buffer GPU direct-compute main path); reference only.
 \*\* 4090/2080 Ti/5090 data measured on the **2026-08-19 bins-v0.6.0 full pipeline** (`moe-l2 start --gpu`, per-domain table switch, default single-table); 5090 is real SM120a data; 3080 Ti still uses the v3.1 multi-arch conditions (bins-v0.3.0).
 
+## Context capability (RTX 3060 12G, 2026-09-09)
+
+Same machine, same day, released engine (A3 expert cache), full-chain `moe-l2 start --gpu`; model Qwen3.6-35B-A3B **UD-IQ2_M** (11.5 GB):
+
+| ctx | VRAM at startup | Gen speed (short prompt) | 45K-token needle retrieval |
+|-----|-----------------|--------------------------|----------------------------|
+| 65536 | 4966 MiB | — | ✅ |
+| 131072 | 6104 MiB | **28.3-29.0 t/s** | ✅ |
+| **262144** (model native) | **8700 MiB** | **25.0-25.3 t/s** | ✅ |
+| 393216 | 11358 MiB | 22.7-22.9 t/s | ✅ |
+| 524288 | ~13.9 GB — does not fit a 12G card | — | — |
+
+- Since PyPI 0.13.1 `--ctx-size` is optional: the CLI targets the model's native context (GGUF `context_length`) and narrows it to what VRAM safely fits — 12G card + IQ2_M auto-lands on 262144 (older builds pinned 8192, a legacy default rather than an engine limit).
+- 45K-token needle retrieval passed at every ctx from 64K to 384K with no degradation; long *summarization* degrading on UD-quantized files is a known file-side weak spot (independent of ctx).
+- **UD-Q4_K_M** (22.1 GB) on the same card caps at **128K** (13-16 t/s, 7963 MiB): ~1.9 GB more non-expert VRAM, less room for KV.
+
 ## VRAM savings (host-buffer expert GPU direct compute + selective/on-demand pin)
 
 | Model | Standard full load | moe-l2 | Savings | Speed retained |

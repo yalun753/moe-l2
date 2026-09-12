@@ -341,4 +341,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # 直接 python -m moe_l2.collect 时也要有 GBK 控制台兜底（见 moe_l2/console.py）
+    from moe_l2.console import enable_safe_console
+
+    enable_safe_console()
     main()
