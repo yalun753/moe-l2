@@ -207,6 +207,14 @@ def _start_llama_server(
     n_ctx: int | None = None,
     n_parallel: int | None = None,
     ctx_force: bool = False,
+    cache_type_k: str | None = None,
+    cache_type_v: str | None = None,
+    flash_attn: str = "on",
+    batch_size: int | None = 16384,
+    ubatch_size: int | None = 2048,
+    spec_type: str | None = None,
+    spec_draft_n_max: int | None = 32,
+    threads: int | None = None,
 ) -> subprocess.Popen:
     """Launch bundled llama-server with GPU support (A3 patch enabled).
 
@@ -272,12 +280,29 @@ def _start_llama_server(
         # Reasonable defaults for consumer GPUs
         "-ngl", "99",       # offload non-expert layers to GPU
     ]
+    # [moe-l2 2026-09-13] 透传 qwencoder.bat 加速参数，提升 GPU 利用率/prefill 并行度
+    if flash_attn and str(flash_attn).lower() != "off":
+        cmd += ["--flash-attn", "on"]
+    if batch_size:
+        cmd += ["--batch-size", str(batch_size)]
+    if ubatch_size:
+        cmd += ["--ubatch-size", str(ubatch_size)]
+    if spec_type:
+        cmd += ["--spec-type", spec_type]
+    if spec_draft_n_max:
+        cmd += ["--spec-draft-n-max", str(spec_draft_n_max)]
+    if threads:
+        cmd += ["--threads", str(threads)]
+    # cont-batching / cache-prompt 总是有益，写死开启
+    cmd += ["--cont-batching", "--cache-prompt", "--cache-reuse", "256"]
 
     # [moe-l2 2026-08-15 显存自适应 / 2026-09-12 自动档] KV 预分配按 parallel × n_ctx，
     # 显存不足直接 cudaMalloc 崩溃（Qwen cache + parallel 4 在 11GB 卡 OOM 实测）。
     # 启动前探测显存 + 按模型 KV 估算自动降档：
     #   未指定 --ctx-size → ctx 自动档 = 模型原生上限，按显存预算收敛（用户不用懂参数）
     #   显式指定 → 作为"期望值"，显存不够仍会降档（--ctx-force 可跳过）
+    # [moe-l2 2026-09-14] KV 估算带上 --cache-type-k/v：f16 估算对 q8_0/q4_0 KV
+    # 严重高估（256K 会被砍到 8K），按量化类型缩放才算得准。
     try:
         from moe_l2.vram_adaptive import compute_safe_params
         params = compute_safe_params(
@@ -285,6 +310,8 @@ def _start_llama_server(
             want_ctx=n_ctx,
             want_parallel=n_parallel or 1,
             force_ctx=ctx_force,
+            kv_type_k=cache_type_k,
+            kv_type_v=cache_type_v,
         )
         n_ctx = params["n_ctx"]
         n_parallel = params["n_parallel"]
@@ -292,10 +319,14 @@ def _start_llama_server(
             print(f"  [vram-adaptive] {params['reason']}")
     except Exception as e:  # 自适应失败不阻塞启动，用默认
         print(f"  [vram-adaptive] ⚠️ 自动降档失败，用默认 c8192/parallel1：{e}")
-        n_ctx = n_ctx or 8192
-        n_parallel = n_parallel or 1
 
     cmd += ["-c", str(n_ctx)]
+    # [moe-l2 2026-09-08 local patch] 量化 KV 透传：256k 上下文在 11-22GB 卡上的
+    # 前提（f16 KV 在 Qwen3-Coder-30B-A3B 上 = 24GiB，物理放不下）。
+    if cache_type_k:
+        cmd += ["--cache-type-k", cache_type_k]
+    if cache_type_v:
+        cmd += ["--cache-type-v", cache_type_v]
     if n_parallel and n_parallel > 1:
         cmd += ["--parallel", str(n_parallel)]
 
@@ -381,6 +412,13 @@ def main():
     from moe_l2.console import enable_safe_console
 
     enable_safe_console()
+    # [fix 2026-09-09] enable_safe_console 只改编码，这里补行缓冲：
+    # stdout 重定向到文件时默认块缓冲，日志会"停更"，排障看不到实时进度。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError, OSError):
+            pass
     parser = argparse.ArgumentParser(
         prog="moe-l2",
         description="MoE inference L2 hot-cache scheduler",
@@ -501,6 +539,94 @@ def main():
             "fixed: hybrid-attention models like qwen35moe were over-estimated ~16x, "
             "which clamped 262144 back to 8192); keep it for models/setups the "
             "estimator cannot size."
+        ),
+    )
+    start_parser.add_argument(
+        "--cache-type-k",
+        type=str,
+        default=None,
+        help=(
+            "[moe-l2 2026-09-08 local patch] K cache quant type, passed through "
+            "to llama-server --cache-type-k (e.g. q8_0, q4_0). Needed for 256k "
+            "ctx on 11-22GB cards: f16 KV of Qwen3-Coder-30B-A3B is ~24GB."
+        ),
+    )
+    start_parser.add_argument(
+        "--cache-type-v",
+        type=str,
+        default=None,
+        help=(
+            "[moe-l2 2026-09-08 local patch] V cache quant type (see --cache-type-k)."
+        ),
+    )
+    start_parser.add_argument(
+        "--ctx-force",
+        action="store_true",
+        help=(
+            "[moe-l2 2026-09-08 local patch] Skip VRAM-adaptive context downgrade, "
+            "use --ctx-size as-is (pair with --cache-type-k/v for 256k)."
+        ),
+    )
+    start_parser.add_argument(
+        "--alias",
+        type=str,
+        default=None,
+        help=(
+            "[moe-l2 2026-09-13] Short model alias returned by GET /v1/models "
+            "(e.g. 'qwen3-coder-30b'). Rewrites the id so clients don't see the "
+            "full GGUF path. Does not affect inference (model field is pass-through)."
+        ),
+    )
+    start_parser.add_argument(
+        "--flash-attn",
+        type=str,
+        default="on",
+        choices=["on", "off"],
+        help=(
+            "[moe-l2 2026-09-13] FlashAttention on/off (default: on). 长上下文下"
+            "开 flash-attn 更省显存、attention 更快。"
+        ),
+    )
+    start_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=16384,
+        help=(
+            "[moe-l2 2026-09-13] llama-server --batch-size (default: 16384). "
+            "增大可拉高 prefill 时 GPU 利用率，但 262k 下显存贴边时可能 transient 溢出。"
+        ),
+    )
+    start_parser.add_argument(
+        "--ubatch-size",
+        type=int,
+        default=2048,
+        help=(
+            "[moe-l2 2026-09-13] llama-server --ubatch-size (default: 2048)."
+        ),
+    )
+    start_parser.add_argument(
+        "--spec-type",
+        type=str,
+        default=None,
+        help=(
+            "[moe-l2 2026-09-13] 投机解码类型 (default: ngram-mod)。"
+            "传空字符串可关闭投机解码。"
+        ),
+    )
+    start_parser.add_argument(
+        "--spec-draft-n-max",
+        type=int,
+        default=32,
+        help=(
+            "[moe-l2 2026-09-13] 投机解码最大 draft 数 (default: 32)。"
+        ),
+    )
+    start_parser.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        help=(
+            "[moe-l2 2026-09-13] llama-server --threads (default: None=自动)。"
         ),
     )
 
@@ -879,7 +1005,7 @@ def cmd_start(args):
         print("Connect your client to http://127.0.0.1:{}".format(args.port))
         print("Press Ctrl+C to stop")
         try:
-            start_proxy(port=args.port, cache=None, backend_url=backend_url, gate=gate)
+            start_proxy(port=args.port, cache=None, backend_url=backend_url, gate=gate, model_alias=getattr(args, "alias", None))
         except KeyboardInterrupt:
             pass
         return 0
@@ -992,6 +1118,14 @@ def cmd_start(args):
                 n_ctx=getattr(args, "ctx_size", None),
                 n_parallel=getattr(args, "parallel", None),
                 ctx_force=getattr(args, "ctx_force", False),
+                cache_type_k=getattr(args, "cache_type_k", None),
+                cache_type_v=getattr(args, "cache_type_v", None),
+                flash_attn=getattr(args, "flash_attn", "on"),
+                batch_size=getattr(args, "batch_size", 16384),
+                ubatch_size=getattr(args, "ubatch_size", 2048),
+                spec_type=getattr(args, "spec_type", None),
+                spec_draft_n_max=getattr(args, "spec_draft_n_max", 32),
+                threads=getattr(args, "threads", None),
             )
         except FileNotFoundError as e:
             print(f"  ERROR: {e}")
@@ -1055,7 +1189,7 @@ def cmd_start(args):
     print("Press Ctrl+C to stop")
 
     try:
-        start_proxy(port=args.port, cache=cache, backend_url=backend_url, gate=gate)
+        start_proxy(port=args.port, cache=cache, backend_url=backend_url, gate=gate, model_alias=getattr(args, "alias", None))
     except KeyboardInterrupt:
         pass
     finally:

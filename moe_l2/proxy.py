@@ -9,7 +9,9 @@ import logging
 import mmap
 import os
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
 import httpx
@@ -169,6 +171,85 @@ class MoEL2ProxyHandler(BaseHTTPRequestHandler):
     cache: Optional[L2Cache] = None
     backend_url: str = OLLAMA_BASE  # overridden per-instance by start_proxy
     gate: Optional["RoutingProfiler"] = None  # online gate adaptation (optional)
+    model_alias: Optional[str] = None  # short alias for /v1/models id rewrite
+
+    # ── 吐字速度统计（2026-09-14）─────────────────────────────
+    # 类级环形缓冲：所有请求线程共享；_forward_stream/_forward_blocking
+    # 解析后端响应里的 timings，记录每次生成的 t/s，供 /stats 与 GUI 展示。
+    _gen_stats: "deque" = None
+    _gen_lock = threading.Lock()
+
+    @classmethod
+    def _record_gen(cls, tps: float, tok: int = 0) -> None:
+        if not tps or tps <= 0:
+            return
+        with cls._gen_lock:
+            if cls._gen_stats is None:
+                cls._gen_stats = deque(maxlen=50)
+            cls._gen_stats.append((time.time(), float(tps), int(tok)))
+
+    @classmethod
+    def _gen_speed_summary(cls) -> dict:
+        with cls._gen_lock:
+            dq = cls._gen_stats
+            if not dq:
+                return {"gen_speed_tps_last": 0.0, "gen_speed_tps_avg": 0.0,
+                        "gen_speed_tps_peak": 0.0, "gen_speed_samples": 0,
+                        "gen_speed_last_tokens": 0}
+            tps_all = [t for (_, t, _) in dq]
+            last = dq[-1]
+            return {
+                "gen_speed_tps_last": round(last[1], 1),
+                "gen_speed_tps_avg": round(sum(tps_all) / len(tps_all), 1),
+                "gen_speed_tps_peak": round(max(tps_all), 1),
+                "gen_speed_samples": len(dq),
+                "gen_speed_last_tokens": last[2],
+            }
+
+    def _ingest_obj(self, obj) -> None:
+        """从后端单次响应 JSON 提取吐字速度并记入统计。"""
+        if not isinstance(obj, dict):
+            return
+        tps = None
+        tok = 0
+        # llama-server /completion 原生格式：timings.predicted_per_second
+        timings = obj.get("timings") or {}
+        if isinstance(timings, dict) and timings.get("predicted_per_second"):
+            tps = float(timings["predicted_per_second"])
+            if obj.get("tokens_predicted"):
+                tok = int(obj["tokens_predicted"])
+        # ollama 风格：eval_count + eval_duration(ns)
+        if tps is None:
+            ec = obj.get("eval_count")
+            ed = obj.get("eval_duration")
+            if ec and ed:
+                tps = float(ec) / (float(ed) / 1e9)
+                tok = int(ec)
+        # OpenAI 风格 usage（仅 token 数，无 duration → 留待流末用墙钟算）
+        if tok == 0:
+            usage = obj.get("usage") or {}
+            if isinstance(usage, dict) and usage.get("completion_tokens"):
+                tok = int(usage["completion_tokens"])
+        if tps is not None and tps > 0:
+            MoEL2ProxyHandler._record_gen(tps, tok)
+            self._pending_tok = None
+        elif tok:
+            self._pending_tok = tok
+
+    def _ingest_line(self, raw: bytes, t_first: float) -> None:
+        """解析一行 SSE/JSON 响应，提取速度。raw 为单行字节。"""
+        line = raw.strip()
+        if not line:
+            return
+        if line.startswith(b"data:"):
+            line = line[5:].lstrip()
+        if line in (b"[DONE]", b"data: [DONE]"):
+            return
+        try:
+            obj = json.loads(line)
+        except (ValueError, json.JSONDecodeError):
+            return
+        self._ingest_obj(obj)
 
     # ── Domain prediction & preloading ──────────────────────────
 
@@ -251,6 +332,8 @@ class MoEL2ProxyHandler(BaseHTTPRequestHandler):
             self._handle_stats()
         elif self.path == "/health":
             self._send_json({"status": "ok", "cache_active": self.cache is not None})
+        elif self.path == "/v1/models":
+            self._handle_models()
         else:
             self._proxy_request("GET")
 
@@ -276,7 +359,11 @@ class MoEL2ProxyHandler(BaseHTTPRequestHandler):
                     self._predict_and_preload(text)
             except Exception:
                 pass
-            self._proxy_request("POST", body)
+            # [fix 2026-09-09] OpenAI 格式改走流式转发：body 里 stream=true 时
+            # 逐 chunk 透传 SSE，客户端首字节立即可见；stream=false 走 blocking。
+            # 原来 _proxy_request 整包缓冲——长生成时客户端必须等全部 token
+            # 完成才收到第一个字节，表现为"问一句话卡几分钟"。
+            self._forward_to_backend(body, self.path)
         else:
             self._proxy_request("POST", body)
 
@@ -332,7 +419,12 @@ class MoEL2ProxyHandler(BaseHTTPRequestHandler):
             client.close()
 
     def _forward_stream(self, client: httpx.Client, url: str, body: bytes):
-        """SSE-stream the response from backend to the client."""
+        """SSE-stream the response from backend to the client.
+
+        同时解析后端响应里的 timings（llama-server timings.predicted_per_second
+        / ollama eval_count+eval_duration）记录吐字速度，供 /stats 与 GUI 展示。
+        """
+        self._pending_tok = None
         try:
             with client.stream(
                 "POST",
@@ -350,18 +442,47 @@ class MoEL2ProxyHandler(BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
 
+                t_first = [None]
+                buf = b""
                 for chunk in resp.iter_bytes():
                     if chunk:
+                        if t_first[0] is None:
+                            t_first[0] = time.time()
                         self.wfile.write(chunk)
                         self.wfile.flush()
+                        buf += chunk
+                        while b"\n" in buf:
+                            line, buf = buf.split(b"\n", 1)
+                            self._ingest_line(line, t_first[0])
+                if buf:
+                    self._ingest_line(buf, t_first[0])
+                # 流末：若后端只给 token 数没给 duration，用墙钟补算 t/s
+                t_end = time.time()
+                if self._pending_tok:
+                    dt = t_end - (t_first[0] or t_end)
+                    if dt > 0:
+                        MoEL2ProxyHandler._record_gen(
+                            self._pending_tok / dt, self._pending_tok)
+                    self._pending_tok = None
         except httpx.ConnectError:
             self._send_error(502, f"cannot connect to backend at {self.backend_url}")
         except httpx.TimeoutException:
             self._send_error(504, "backend request timed out")
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError):
+            # [fix 2026-09-09] 客户端中途断开（超时/用户取消）很常见，
+            # 静默退出即可，不要打 traceback（之前刷爆控制台的 WinError 10054）。
+            # Windows 上断连会随机表现为 10054(ConnectionResetError)/
+            # 10053(ConnectionAbortedError)/BrokenPipeError，三种都要捕。
+            # 注意：后端生成仍会继续跑完，如需真正中断需支持 /v1/streams 取消。
+            logger.debug("client disconnected during stream, aborted")
+            self.close_connection = True
 
     def _forward_blocking(self, client: httpx.Client, url: str, body: bytes):
         """Non-streaming forward: wait for full response, return as-is."""
+        self._pending_tok = None
         try:
+            t_start = time.time()
             resp = client.post(
                 url,
                 content=body,
@@ -369,10 +490,20 @@ class MoEL2ProxyHandler(BaseHTTPRequestHandler):
             )
             self.send_response(resp.status_code)
             for key, value in resp.headers.items():
+
                 if key.lower() not in _HOP_BY_HOP:
                     self.send_header(key, value)
             self.end_headers()
             self.wfile.write(resp.content)
+            # 解析完整响应（可能 SSE 多行或单 JSON）提取速度
+            for line in resp.content.split(b"\n"):
+                self._ingest_line(line, t_start)
+            if self._pending_tok:
+                dt = time.time() - t_start
+                if dt > 0:
+                    MoEL2ProxyHandler._record_gen(
+                        self._pending_tok / dt, self._pending_tok)
+                self._pending_tok = None
         except httpx.ConnectError:
             self._send_error(502, f"cannot connect to backend at {self.backend_url}")
         except httpx.TimeoutException:
@@ -393,6 +524,15 @@ class MoEL2ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(resp.content)
         except httpx.ConnectError:
             self._send_error(502, f"cannot connect to backend at {self.backend_url}")
+        except httpx.TimeoutException:
+            # [fix 2026-09-09] 原来没捕获：后端超时会直接崩线程（单线程模式下
+            # 整个 proxy 陪葬）。现在回 504，线程活下来。
+            self._send_error(504, "backend request timed out")
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError):
+            # 客户端中途断开：静默退出，不打 traceback（10053/10054/BrokenPipe 全覆盖）
+            logger.debug("client disconnected during proxy request")
+            self.close_connection = True
         finally:
             client.close()
 
@@ -410,6 +550,19 @@ class MoEL2ProxyHandler(BaseHTTPRequestHandler):
         logger.error(message)
         self._send_json({"error": message}, status)
 
+    def _handle_models(self):
+        """Proxy /v1/models but rewrite id to a short alias if configured."""
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.get(f"{self.backend_url}/v1/models")
+                data = resp.json()
+            if MoEL2ProxyHandler.model_alias:
+                for m in data.get("data", []):
+                    m["id"] = MoEL2ProxyHandler.model_alias
+            self._send_json(data)
+        except Exception as e:
+            self._send_error(502, f"cannot fetch models from backend: {e}")
+
     def _handle_stats(self):
         """Return cache statistics as JSON (for 'moe-l2 stats')."""
         if not self.cache:
@@ -419,6 +572,8 @@ class MoEL2ProxyHandler(BaseHTTPRequestHandler):
             stats = self.cache.stats()
             # 模式 B 数据飞轮状态
             stats.update(training_stats())
+            # 吐字速度统计（2026-09-14）
+            stats.update(MoEL2ProxyHandler._gen_speed_summary())
             # Return compact version for CLI consumption
             self._send_json(stats)
         except Exception as e:
@@ -434,6 +589,7 @@ def start_proxy(
     cache: Optional[L2Cache] = None,
     backend_url: str = OLLAMA_BASE,
     gate: Optional["RoutingProfiler"] = None,
+    model_alias: Optional[str] = None,
 ):
     """Start the moe-l2 proxy server.
 
@@ -446,9 +602,14 @@ def start_proxy(
     """
     MoEL2ProxyHandler.cache = cache
     MoEL2ProxyHandler.gate = gate
+    MoEL2ProxyHandler.model_alias = model_alias
     # Patch the backend URL onto the handler
     MoEL2ProxyHandler.backend_url = backend_url
-    server = HTTPServer((host, port), MoEL2ProxyHandler)
+    # [fix 2026-09-09] HTTPServer 单线程：一个长生成请求会独占唯一线程，
+    # 期间所有其他请求（UI 轮询/stats/新对话）全部冻结。改 ThreadingHTTPServer
+    # 每请求一线程，互不阻塞。cache/gate 内部有 RLock，共享安全。
+    server = ThreadingHTTPServer((host, port), MoEL2ProxyHandler)
+    server.daemon_threads = True
     server.timeout = 0.5  # allow KeyboardInterrupt to work
     logger.info("moe-l2 proxy listening on %s:%s → %s", host, port, backend_url)
     try:

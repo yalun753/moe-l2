@@ -321,7 +321,16 @@ def build_router_map_file(model_path: str, router_top_k: int = 75,
     if table_path is None:
         if llama_cli is None:
             bin_dir = Path(__file__).resolve().parent / "bin"
-            llama_cli = str(bin_dir / "llama-cli") if (bin_dir / "llama-cli").exists() else None
+            # Windows: the bundled binary is llama-cli.exe, not llama-cli
+            _cli_cands = (
+                ["llama-cli.exe", "llama-cli"]
+                if os.name == "nt"
+                else ["llama-cli", "llama-cli.exe"]
+            )
+            for _c in _cli_cands:
+                if (bin_dir / _c).exists():
+                    llama_cli = str(bin_dir / _c)
+                    break
         if llama_cli:
             table_path = auto_collect(model_path, llama_cli, data_dir, coverage_target=coverage_target)
         else:
