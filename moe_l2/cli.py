@@ -560,14 +560,6 @@ def main():
         ),
     )
     start_parser.add_argument(
-        "--ctx-force",
-        action="store_true",
-        help=(
-            "[moe-l2 2026-09-08 local patch] Skip VRAM-adaptive context downgrade, "
-            "use --ctx-size as-is (pair with --cache-type-k/v for 256k)."
-        ),
-    )
-    start_parser.add_argument(
         "--alias",
         type=str,
         default=None,
