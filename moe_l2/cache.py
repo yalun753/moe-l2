@@ -82,9 +82,11 @@ class L2Cache:
             self.expert_size = (
                 expert_size or self._gguf_reader.per_expert_size()
             )
+            self._num_experts = self._gguf_reader.num_experts
         else:
             self.n_layers = n_layers or DEFAULT_N_LAYERS
             self.expert_size = expert_size or DEFAULT_EXPERT_SIZE
+            self._num_experts = None
 
         self.slots_per_layer = slots_per_layer
         self.l2_dir = l2_dir or DEFAULT_L2_DIR
@@ -195,9 +197,14 @@ class L2Cache:
             expert_map: Domain→expert mapping dict (from predictor._get_map()).
         """
         domain_data = expert_map.get("domains", {}).get(domain, {})
-        per_layer_top = domain_data.get("per_layer_top", {})
+        per_layer_top = dict(domain_data.get("per_layer_top", {}))
         if not per_layer_top:
             return
+        # 全覆盖兜底（2026-09-14）：C++ EXPERT_LOG 可能未覆盖后段层
+        # （如 48 层模型只记前 40 层）→ 路由表缺失这些层 → f4 空白。
+        # 对缓存探测到的真实层、路由表未含的层，盲补该层 top-k 专家，
+        # 让 L2Cache 接管全部 MoE 层（无 model_path 不生效）。
+        self._backfill_missing_layers(per_layer_top)
 
         with self._lock:
             # 平滑切换：旧域专家降级为 LRU 可淘汰（仍留在缓存，靠 LRU 自然衰减），
@@ -234,6 +241,20 @@ class L2Cache:
                 if (layer, eid) not in self._pending_loads:
                     f = self._loader.submit(self._load_expert, layer, eid)
                     self._pending_loads[(layer, eid)] = f
+
+    def _backfill_missing_layers(self, per_layer_top: dict) -> None:
+        """覆盖率兜底：对缓存探测到的真实层、但路由表缺失的层，盲补 top-k 专家。
+
+        不依赖领域路由统计，按各层最大专家数（与其他层一致）盲选 0..k-1。
+        无 model_path（_num_experts=None）或层已全部覆盖时为空操作。
+        """
+        if self._num_experts is None or self._num_experts <= 0:
+            return
+        k = max((len(v) for v in per_layer_top.values()), default=self.slots_per_layer)
+        k = min(k, self.slots_per_layer, self._num_experts)
+        for layer in range(self.n_layers):
+            if layer not in per_layer_top:
+                per_layer_top[layer] = list(range(k))
 
     def promote_domain(self, domain: str, expert_map: dict) -> None:
         """预热：检测到路由漂移时抬高目标域专家的 LRU 优先级。

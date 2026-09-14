@@ -49,6 +49,13 @@ AUTO_CTX_MAX = 262144
 AUTO_CTX_FALLBACK = 8192
 # 显存预算占总显存比例（与 router_table.DEFAULT_VRAM_BUDGET_RATIO 一致）
 VRAM_BUDGET_RATIO = 0.6
+# KV 量化类型 → 相对 f16 每元素字节比例（llama.cpp block 布局，用于估算）
+# q8_0=34B/32el, q6_k=6.5625bpw, q5_k=5.625bpw, q5_1=28B/32el, q4_k=4.4375bpw, q4_0=18B/32el
+KV_TYPE_RATIO = {
+    "f16": 1.0, "f32": 2.0,
+    "q8_0": 34 / 64, "q6_k": 6.5625 / 16, "q5_k": 5.625 / 16,
+    "q5_1": 28 / 64, "q4_k": 4.4375 / 16, "q4_0": 18 / 64,
+}
 # MLA 架构（KV 极小，不按 GQA 公式降档）
 MLA_ARCHS = ("deepseek2", "dsv4", "deepseek-v2", "deepseek-v3", "deepseek-v4")
 
@@ -193,10 +200,15 @@ def _arch_is_mla(meta: dict) -> bool:
     return False
 
 
-def estimate_kv_bytes_per_token(model_path: str) -> float:
-    """估算每 token 的 KV cache 字节数（F16，K+V）。
+def estimate_kv_bytes_per_token(
+    model_path: str,
+    kv_type_k: str | None = None,
+    kv_type_v: str | None = None,
+) -> float:
+    """估算每 token 的 KV cache 字节数（默认 F16，K+V）。
 
-    kv_bytes = n_kv_layers × head_count_kv × (key_length + value_length) × 2 (F16)
+    kv_bytes = n_kv_layers × head_count_kv × (key_length × r_k + value_length × r_v) × 2
+    r_k/r_v = KV 量化类型相对 f16 的字节比例（--cache-type-k/v，默认 f16 = 1.0）。
     再乘 KV_SAFETY。MLA 架构（deepseek2 系列）KV 是 latent 压缩（32K 上下文仅
     几十 MiB），直接返回小值（按 1MB/32K token 估）避免公式高估导致误降档。
     """
@@ -232,7 +244,10 @@ def estimate_kv_bytes_per_token(model_path: str) -> float:
         else:
             return 0.0
 
-    kv_per_token = n_kv_layers * n_kv_heads * (head_dim_k + head_dim_v) * 2  # K+V, F16
+    rk = KV_TYPE_RATIO.get((kv_type_k or "f16").lower(), 1.0)
+    rv = KV_TYPE_RATIO.get((kv_type_v or "f16").lower(), 1.0)
+    # K+V；K/V 的 head_dim 各按自己的量化类型缩放（f16 时 rk=rv=1.0，与 F16 公式等价）
+    kv_per_token = n_kv_layers * n_kv_heads * (head_dim_k * rk + head_dim_v * rv) * 2
     return float(kv_per_token) * KV_SAFETY
 
 
@@ -256,6 +271,8 @@ def compute_safe_params(
     want_ctx: int | None = None,
     want_parallel: int = 1,
     force_ctx: bool = False,
+    kv_type_k: str | None = None,
+    kv_type_v: str | None = None,
 ) -> dict:
     """根据显存算 safe (n_ctx, n_parallel, kv_budget_gb, reason, auto)。
 
@@ -298,7 +315,7 @@ def compute_safe_params(
     free_gb = free_mb / 1024.0
     fixed_gb = estimate_fixed_vram_gb(model_path)
     kv_budget_gb = free_gb - fixed_gb - free_gb * CACHE_RESERVE_RATIO
-    kv_per_token = estimate_kv_bytes_per_token(model_path)
+    kv_per_token = estimate_kv_bytes_per_token(model_path, kv_type_k, kv_type_v)
 
     # 预算算不出（负预算/模型信息缺失）：
     #   自动档 → 退回历史默认 8192，绝不放行原生上限（否则必 OOM）；

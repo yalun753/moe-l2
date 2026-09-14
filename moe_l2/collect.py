@@ -139,6 +139,10 @@ def collect_routing(llama_cli: str, model_path: str, prompt: str, n_tokens: int,
     """
     env = os.environ.copy()
     env["LLAMA_EXPERT_LOG"] = "1"
+    # [fix 2026-09-13] 镜像后端 GPU 专家快路径：GGML_OP_OFFLOAD_MIN_BATCH=1 +
+    # GGML_CUDA_EXPERT_CACHE=1（与 _start_llama_server 同款），40B 才不卡在 CPU 算专家。
+    env["GGML_OP_OFFLOAD_MIN_BATCH"] = "1"
+    env["GGML_CUDA_EXPERT_CACHE"] = "1"
     if os.name != "nt":
         # Linux: point dynamic linker at the bundled .so files next to llama-cli.
         # Windows: DLLs next to llama-cli.exe are auto-loaded.
@@ -146,7 +150,8 @@ def collect_routing(llama_cli: str, model_path: str, prompt: str, n_tokens: int,
         env["LD_LIBRARY_PATH"] = lib_dir + (":" + env.get("LD_LIBRARY_PATH", "") if env.get("LD_LIBRARY_PATH") else "")
 
     cmd = [llama_cli, "-m", model_path, "-p", prompt, "-n", str(n_tokens),
-           "--no-display-prompt", "-c", "2048", "-t", "16", "--no-warmup"]
+           "--no-display-prompt", "-c", "2048", "-t", "16", "--no-warmup",
+           "-ngl", "99"]
 
     tmp = tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False)
     tmp_path = tmp.name
