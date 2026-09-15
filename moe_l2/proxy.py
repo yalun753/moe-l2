@@ -9,7 +9,7 @@ import logging
 import mmap
 import os
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
 import httpx
@@ -276,7 +276,11 @@ class MoEL2ProxyHandler(BaseHTTPRequestHandler):
                     self._predict_and_preload(text)
             except Exception:
                 pass
-            self._proxy_request("POST", body)
+            # [merge/sagasm 2026-09-15] OpenAI 格式改走 _forward_to_backend：body 里
+            # stream=true 时逐 chunk 透传 SSE，客户端首字节立即可见；stream=false 走
+            # blocking。原来走 _proxy_request 是整包缓冲——长生成时客户端必须等全部
+            # token 生成完才收到第一个字节，表现为"问一句话卡几分钟"。
+            self._forward_to_backend(body, self.path)
         else:
             self._proxy_request("POST", body)
 
@@ -358,6 +362,15 @@ class MoEL2ProxyHandler(BaseHTTPRequestHandler):
             self._send_error(502, f"cannot connect to backend at {self.backend_url}")
         except httpx.TimeoutException:
             self._send_error(504, "backend request timed out")
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError):
+            # [merge/sagasm 2026-09-15] 客户端中途断开（超时/用户取消）很常见，静默
+            # 退出即可，不要打 traceback（之前刷爆控制台的 WinError 10054）。Windows
+            # 上断连会随机表现为 10054(ConnectionResetError) / 10053(
+            # ConnectionAbortedError) / BrokenPipeError，三种都要捕。
+            # 注意：后端生成仍会继续跑完，如需真正中断需支持取消接口。
+            logger.debug("client disconnected during stream, aborted")
+            self.close_connection = True
 
     def _forward_blocking(self, client: httpx.Client, url: str, body: bytes):
         """Non-streaming forward: wait for full response, return as-is."""
@@ -393,6 +406,16 @@ class MoEL2ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(resp.content)
         except httpx.ConnectError:
             self._send_error(502, f"cannot connect to backend at {self.backend_url}")
+        except httpx.TimeoutException:
+            # [merge/sagasm 2026-09-15] 原来没捕获：后端超时会直接崩掉处理线程
+            # （单线程模式下整个 proxy 陪葬）。现在回 504，线程活下来。
+            self._send_error(504, "backend request timed out")
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError):
+            # [merge/sagasm 2026-09-15] 客户端中途断开：静默退出，不打 traceback
+            # （10053/10054/BrokenPipe 全覆盖）。
+            logger.debug("client disconnected during proxy request")
+            self.close_connection = True
         finally:
             client.close()
 
@@ -448,7 +471,11 @@ def start_proxy(
     MoEL2ProxyHandler.gate = gate
     # Patch the backend URL onto the handler
     MoEL2ProxyHandler.backend_url = backend_url
-    server = HTTPServer((host, port), MoEL2ProxyHandler)
+    # [merge/sagasm 2026-09-15] HTTPServer 单线程：一个长生成请求会独占唯一线程，
+    # 期间所有其他请求（UI 轮询 / stats / 新对话）全部冻结。ThreadingHTTPServer
+    # 每请求一线程，互不阻塞；cache / gate 内部有 RLock，共享安全。
+    server = ThreadingHTTPServer((host, port), MoEL2ProxyHandler)
+    server.daemon_threads = True
     server.timeout = 0.5  # allow KeyboardInterrupt to work
     logger.info("moe-l2 proxy listening on %s:%s → %s", host, port, backend_url)
     try:

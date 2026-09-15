@@ -207,6 +207,14 @@ def _start_llama_server(
     n_ctx: int | None = None,
     n_parallel: int | None = None,
     ctx_force: bool = False,
+    cache_type_k: str | None = None,
+    cache_type_v: str | None = None,
+    flash_attn: str | None = None,
+    batch_size: int | None = None,
+    ubatch_size: int | None = None,
+    spec_type: str | None = None,
+    spec_draft_n_max: int | None = None,
+    threads: int | None = None,
 ) -> subprocess.Popen:
     """Launch bundled llama-server with GPU support (A3 patch enabled).
 
@@ -219,6 +227,11 @@ def _start_llama_server(
     n_ctx=None → ctx 自动档 = 模型原生上限按显存预算收敛（2026-09-12）。
     ctx_force: --ctx-force，显式指定 n_ctx 时跳过 vram_adaptive 自动降档
     （2026-09-09，信任用户明确知道显存放得下的场景）。
+    [merge/sagasm 2026-09-15] cache_type_k/v：KV 量化类型（--cache-type-k/v），
+    既透传给 llama-server，也喂给 vram_adaptive 的 KV 估算（f16 估算对量化 KV
+    会高估，导致长上下文被误降档）。其余 flash_attn / batch_size / ubatch_size /
+    spec_type / spec_draft_n_max / threads 均为 opt-in 透传：默认 None = 完全不传，
+    行为与合并前一致（不替用户改默认值）。
     """
     if not _LLAMA_SERVER_PATH.exists():
         raise FileNotFoundError(
@@ -273,6 +286,23 @@ def _start_llama_server(
         "-ngl", "99",       # offload non-expert layers to GPU
     ]
 
+    # [merge/sagasm 2026-09-15] llama-server 参数透传口子，全部 opt-in（不给 = 不传，
+    # 行为与合并前完全一致）。原来这些参数一个都传不下去，用户想调只能改源码。
+    # 注：未采纳原 patch 里硬编码的 --cont-batching / --cache-prompt /
+    # --cache-reuse 256（那会替所有用户改默认值，属显存换速度，见 B 组待议）。
+    if flash_attn:
+        cmd += ["--flash-attn", str(flash_attn)]
+    if batch_size:
+        cmd += ["--batch-size", str(batch_size)]
+    if ubatch_size:
+        cmd += ["--ubatch-size", str(ubatch_size)]
+    if spec_type:
+        cmd += ["--spec-type", str(spec_type)]
+    if spec_draft_n_max:
+        cmd += ["--spec-draft-n-max", str(spec_draft_n_max)]
+    if threads:
+        cmd += ["--threads", str(threads)]
+
     # [moe-l2 2026-08-15 显存自适应 / 2026-09-12 自动档] KV 预分配按 parallel × n_ctx，
     # 显存不足直接 cudaMalloc 崩溃（Qwen cache + parallel 4 在 11GB 卡 OOM 实测）。
     # 启动前探测显存 + 按模型 KV 估算自动降档：
@@ -285,6 +315,8 @@ def _start_llama_server(
             want_ctx=n_ctx,
             want_parallel=n_parallel or 1,
             force_ctx=ctx_force,
+            kv_type_k=cache_type_k,
+            kv_type_v=cache_type_v,
         )
         n_ctx = params["n_ctx"]
         n_parallel = params["n_parallel"]
@@ -296,6 +328,12 @@ def _start_llama_server(
         n_parallel = n_parallel or 1
 
     cmd += ["-c", str(n_ctx)]
+    # [merge/sagasm 2026-09-15] KV 量化透传：长上下文在 11-22GB 卡上的前提
+    # （30B-A3B 的 f16 KV 在 256K 下约 24GB，物理放不下）。不传则维持 f16。
+    if cache_type_k:
+        cmd += ["--cache-type-k", cache_type_k]
+    if cache_type_v:
+        cmd += ["--cache-type-v", cache_type_v]
     if n_parallel and n_parallel > 1:
         cmd += ["--parallel", str(n_parallel)]
 
@@ -501,6 +539,79 @@ def main():
             "fixed: hybrid-attention models like qwen35moe were over-estimated ~16x, "
             "which clamped 262144 back to 8192); keep it for models/setups the "
             "estimator cannot size."
+        ),
+    )
+    # [merge/sagasm 2026-09-15] KV 量化 + llama-server 参数透传（全部 opt-in，
+    # 默认 None = 不传 = 行为同合并前）。
+    start_parser.add_argument(
+        "--cache-type-k",
+        type=str,
+        default=None,
+        help=(
+            "[merge/sagasm 2026-09-15] K cache quant type, passed through to "
+            "llama-server --cache-type-k (e.g. q8_0, q4_0). Needed for long ctx "
+            "on 11-22GB cards: f16 KV of a 30B-A3B model is ~24GB at 256K. "
+            "Also feeds the VRAM auto-downgrade estimator (f16 estimate would "
+            "over-count a quantized KV and clamp 256K back to 8K)."
+        ),
+    )
+    start_parser.add_argument(
+        "--cache-type-v",
+        type=str,
+        default=None,
+        help="[merge/sagasm 2026-09-15] V cache quant type (see --cache-type-k).",
+    )
+    start_parser.add_argument(
+        "--flash-attn",
+        type=str,
+        default=None,
+        choices=["on", "off"],
+        help=(
+            "[merge/sagasm 2026-09-15] Pass --flash-attn to llama-server. "
+            "Omit to keep llama.cpp's own default."
+        ),
+    )
+    start_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help=(
+            "[merge/sagasm 2026-09-15] Pass --batch-size to llama-server "
+            "(llama.cpp default is used when omitted). Larger raises prefill GPU "
+            "utilization but eats compute-buffer VRAM."
+        ),
+    )
+    start_parser.add_argument(
+        "--ubatch-size",
+        type=int,
+        default=None,
+        help="[merge/sagasm 2026-09-15] Pass --ubatch-size to llama-server.",
+    )
+    start_parser.add_argument(
+        "--spec-type",
+        type=str,
+        default=None,
+        help=(
+            "[merge/sagasm 2026-09-15] Pass --spec-type (speculative decoding "
+            "type) to llama-server."
+        ),
+    )
+    start_parser.add_argument(
+        "--spec-draft-n-max",
+        type=int,
+        default=None,
+        help=(
+            "[merge/sagasm 2026-09-15] Pass --spec-draft-n-max (max draft "
+            "tokens) to llama-server."
+        ),
+    )
+    start_parser.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        help=(
+            "[merge/sagasm 2026-09-15] Pass --threads to llama-server "
+            "(default: llama.cpp decides)."
         ),
     )
 
@@ -992,6 +1103,14 @@ def cmd_start(args):
                 n_ctx=getattr(args, "ctx_size", None),
                 n_parallel=getattr(args, "parallel", None),
                 ctx_force=getattr(args, "ctx_force", False),
+                cache_type_k=getattr(args, "cache_type_k", None),
+                cache_type_v=getattr(args, "cache_type_v", None),
+                flash_attn=getattr(args, "flash_attn", None),
+                batch_size=getattr(args, "batch_size", None),
+                ubatch_size=getattr(args, "ubatch_size", None),
+                spec_type=getattr(args, "spec_type", None),
+                spec_draft_n_max=getattr(args, "spec_draft_n_max", None),
+                threads=getattr(args, "threads", None),
             )
         except FileNotFoundError as e:
             print(f"  ERROR: {e}")

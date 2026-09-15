@@ -100,7 +100,7 @@ def test_parallel_downgraded_before_ctx(monkeypatch):
 def test_mla_tiny_kv_keeps_parallel(monkeypatch):
     """小 KV（DS/V4 MLA）：KV 极小 → parallel 4 保持。"""
     monkeypatch.setattr(va, "probe_vram_mb", lambda: (11264, 6000))
-    monkeypatch.setattr(va, "estimate_kv_bytes_per_token", lambda p: 32.0)
+    monkeypatch.setattr(va, "estimate_kv_bytes_per_token", lambda p, k=None, v=None: 32.0)
 
     r = va.compute_safe_params("/ds.gguf", want_ctx=8192, want_parallel=4)
     assert r["n_parallel"] == 4
@@ -249,3 +249,52 @@ def test_ctx_force_default_off_preserves_downgrade(monkeypatch):
     r = va.compute_safe_params("/qwen.gguf", want_ctx=1048576)
     assert r["n_ctx"] == 262144  # 12G + IQ2 的实测甜点档（旧版被压到 8192）
     assert "降档" in r["reason"]
+
+
+# ── [merge/sagasm 2026-09-15] KV 量化类型（--cache-type-k/v）─────────────────
+
+def test_kv_quant_type_scales_kv_estimate():
+    """量化 KV 按 bpw 比例缩小估算（比例来源 = pinned ggml-common.h block 布局）。"""
+    f16 = va.estimate_kv_bytes_per_token("/qwen.gguf")
+    assert f16 > 0
+    # q8_0 = 8.5bpw / f16 16bpw
+    assert va.estimate_kv_bytes_per_token("/qwen.gguf", "q8_0", "q8_0") == pytest.approx(
+        f16 * 8.5 / 16
+    )
+    # q4_0 = 4.5bpw
+    assert va.estimate_kv_bytes_per_token("/qwen.gguf", "q4_0", "q4_0") == pytest.approx(
+        f16 * 4.5 / 16
+    )
+    # 只量化 K（V 仍 f16）→ 落在两者之间
+    only_k = va.estimate_kv_bytes_per_token("/qwen.gguf", "q8_0", None)
+    assert f16 * 4.5 / 16 < only_k < f16
+    # 未知类型按 f16 估（偏保守，不会低估导致 OOM）
+    assert va.estimate_kv_bytes_per_token("/qwen.gguf", "bogus", "bogus") == f16
+
+
+def test_compute_safe_params_forwards_cache_type(monkeypatch):
+    """compute_safe_params 必须把 --cache-type-k/v 透传给 KV 估算（否则量化 KV 被误降档）。"""
+    seen = {}
+    monkeypatch.setattr(va, "probe_vram_mb", lambda: (12288, 11255))
+    monkeypatch.setattr(va, "estimate_fixed_vram_gb", lambda p: 2.0)
+
+    def spy(p, k=None, v=None):
+        seen["k"], seen["v"] = k, v
+        return 5000.0
+
+    monkeypatch.setattr(va, "estimate_kv_bytes_per_token", spy)
+    va.compute_safe_params("/q.gguf", kv_type_k="q8_0", kv_type_v="q4_0")
+    assert seen == {"k": "q8_0", "v": "q4_0"}
+
+
+def test_quantized_kv_recovers_long_ctx(monkeypatch):
+    """量化 KV 把被 f16 估算误砍的长上下文放回来（用户场景：256K 被砍到 8K）。"""
+    monkeypatch.setattr(va, "probe_vram_mb", lambda: (12288, 11000))
+    monkeypatch.setattr(va, "_model_facts", lambda p: _facts(ctx=262144, kv_layers=40))
+
+    f16 = va.compute_safe_params("/q.gguf", want_ctx=262144,
+                                 kv_type_k="f16", kv_type_v="f16")
+    q8 = va.compute_safe_params("/q.gguf", want_ctx=262144,
+                                kv_type_k="q8_0", kv_type_v="q8_0")
+    assert f16["n_ctx"] < 262144          # f16 估算放不下 → 降档（这就是那个 bug）
+    assert q8["n_ctx"] > f16["n_ctx"]     # 量化 KV 后能开更大

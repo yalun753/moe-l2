@@ -321,7 +321,16 @@ def build_router_map_file(model_path: str, router_top_k: int = 75,
     if table_path is None:
         if llama_cli is None:
             bin_dir = Path(__file__).resolve().parent / "bin"
-            llama_cli = str(bin_dir / "llama-cli") if (bin_dir / "llama-cli").exists() else None
+            # [merge/sagasm 2026-09-15] Windows 包里的二进制是 llama-cli.exe，原来
+            # 写死无扩展名 → exists() 为假 → selective-pin 采集被静默跳过（降级
+            # on-demand，A3 热专家功能在 Windows 上等于没开）。按平台优先探测正确
+            # 名字，再回退另一个。
+            _cli_cands = (["llama-cli.exe", "llama-cli"] if os.name == "nt"
+                          else ["llama-cli", "llama-cli.exe"])
+            for _cand in _cli_cands:
+                if (bin_dir / _cand).exists():
+                    llama_cli = str(bin_dir / _cand)
+                    break
         if llama_cli:
             table_path = auto_collect(model_path, llama_cli, data_dir, coverage_target=coverage_target)
         else:
