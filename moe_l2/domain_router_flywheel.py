@@ -35,8 +35,13 @@ DEFAULT_MAP_PATH = DATA_DIR / "domain_router_map_flywheel.json"  # legacy fallba
 # 每层每领域保留的高频专家数（与验证报告 top-75 对齐；Qwen 用 top-100 也兼容）
 # [2026-08-16 实验] top_k 75→100：验证提高路由表覆盖能否提升命中率（08-13 大表 3971 专家命中 87.5% vs 3000 专家 71.8%）
 DEFAULT_TOP_K = 100
-# 触发重建路由表的 EXPERT 记录阈值（个人使用约 1-2 天）
+# 触发重建路由表的 EXPERT 记录阈值
 REBUILD_EVERY_N = 5000
+# [2026-09-19 节流] 重建最小间隔（秒）。5000 条门槛 ≈ 16 个 token 的生成量
+# （每 token 40 层 × 8 专家 = 320 条），不节流就会几秒重写一次表 → 每次重建都
+# 触发换表/重新预热，表现为“flywheel rebuilt 反复触发”+ 速度抖动（历史待查项）。
+# 默认 60s：一分钟最多重建一次；MOE_L2_REBUILD_MIN_INTERVAL 可覆盖。
+REBUILD_MIN_INTERVAL_S = 60.0
 # 至少需要多少条才开始重建（防止刚启动就用 3 条记录覆盖真实表）
 MIN_RECORDS_FOR_REBUILD = 500
 
@@ -54,6 +59,7 @@ class DomainRouterFlywheel:
         top_k: int = DEFAULT_TOP_K,
         rebuild_every: int = REBUILD_EVERY_N,
         min_records: int = MIN_RECORDS_FOR_REBUILD,
+        rebuild_min_interval: float | None = None,
     ) -> None:
         # [2026-08-13 flywheel B] 按模型分文件：map_path 未显式指定时，
         # 用 domain_router_map_flywheel_{model_id}.json；无 model_id 时回退 legacy 单文件。
@@ -66,6 +72,15 @@ class DomainRouterFlywheel:
         self.top_k = top_k
         self.rebuild_every = rebuild_every
         self.min_records = min_records
+        if rebuild_min_interval is None:
+            try:
+                rebuild_min_interval = float(
+                    os.environ.get("MOE_L2_REBUILD_MIN_INTERVAL",
+                                   REBUILD_MIN_INTERVAL_S))
+            except (TypeError, ValueError):
+                rebuild_min_interval = REBUILD_MIN_INTERVAL_S
+        self.rebuild_min_interval = max(0.0, float(rebuild_min_interval))
+        self._last_rebuild = 0.0
 
         # 当前领域（由请求级信号设置，默认 general）
         self._domain = "general"
@@ -167,7 +182,8 @@ class DomainRouterFlywheel:
                     if x:
                         dom_counter[int(x)] += 1
                         self._records += 1
-            if self._records >= self.rebuild_every:
+            if (self._records >= self.rebuild_every
+                    and time.time() - self._last_rebuild >= self.rebuild_min_interval):
                 self._rebuild_locked()
 
     def maybe_rebuild(self, force: bool = False) -> bool:
@@ -225,6 +241,7 @@ class DomainRouterFlywheel:
         os.replace(tmp, self.map_path)  # 原子替换
         self._rebuilds += 1
         self._records = 0
+        self._last_rebuild = time.time()
         # 注意：不清空 _agg —— 数据飞轮要跨 rebuild 累积，
         # 每次重建都是"全量历史 + 新增"的聚合，路由表越用越准。
         logger.info(

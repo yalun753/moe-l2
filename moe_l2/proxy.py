@@ -169,6 +169,9 @@ class MoEL2ProxyHandler(BaseHTTPRequestHandler):
     cache: Optional[L2Cache] = None
     backend_url: str = OLLAMA_BASE  # overridden per-instance by start_proxy
     gate: Optional["RoutingProfiler"] = None  # online gate adaptation (optional)
+    # [sagasm C1 2026-09-19] 短模型名：GET /v1/models 里把 id 改写成它（未配则原样透传）。
+    # 很多客户端启动时会探 /v1/models，拿到全路径模型名不好用。
+    model_alias: Optional[str] = None
 
     # ── Domain prediction & preloading ──────────────────────────
 
@@ -249,6 +252,8 @@ class MoEL2ProxyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/stats":
             self._handle_stats()
+        elif self.path == "/v1/models":
+            self._handle_models()
         elif self.path == "/health":
             self._send_json({"status": "ok", "cache_active": self.cache is not None})
         else:
@@ -433,6 +438,23 @@ class MoEL2ProxyHandler(BaseHTTPRequestHandler):
         logger.error(message)
         self._send_json({"error": message}, status)
 
+    def _handle_models(self):
+        """转发 GET /v1/models；配了 --alias 时把 id 改写成短名。"""
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.get(f"{self.backend_url}/v1/models")
+                data = resp.json()
+        except httpx.ConnectError:
+            self._send_error(502, f"cannot connect to backend at {self.backend_url}")
+            return
+        except httpx.TimeoutException:
+            self._send_error(504, "backend request timed out")
+            return
+        except Exception as e:
+            self._send_error(502, f"cannot fetch models from backend: {e}")
+            return
+        self._send_json(rewrite_model_ids(data, MoEL2ProxyHandler.model_alias))
+
     def _handle_stats(self):
         """Return cache statistics as JSON (for 'moe-l2 stats')."""
         if not self.cache:
@@ -457,6 +479,7 @@ def start_proxy(
     cache: Optional[L2Cache] = None,
     backend_url: str = OLLAMA_BASE,
     gate: Optional["RoutingProfiler"] = None,
+    model_alias: Optional[str] = None,
 ):
     """Start the moe-l2 proxy server.
 
@@ -469,6 +492,7 @@ def start_proxy(
     """
     MoEL2ProxyHandler.cache = cache
     MoEL2ProxyHandler.gate = gate
+    MoEL2ProxyHandler.model_alias = model_alias
     # Patch the backend URL onto the handler
     MoEL2ProxyHandler.backend_url = backend_url
     # [merge/sagasm 2026-09-15] HTTPServer 单线程：一个长生成请求会独占唯一线程，
@@ -483,3 +507,19 @@ def start_proxy(
     except KeyboardInterrupt:
         logger.info("Shutting down")
         server.server_close()
+
+
+def rewrite_model_ids(payload, alias):
+    """[sagasm C1 2026-09-19] 把 /v1/models 返回里的模型 id 换成长名 alias。
+
+    未配 alias（None/空）→ 原样返回；payload 结构异常也只原样返回，绝不改坏响应。
+    """
+    if not alias or not isinstance(payload, dict):
+        return payload
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return payload
+    for m in data:
+        if isinstance(m, dict):
+            m["id"] = alias
+    return payload

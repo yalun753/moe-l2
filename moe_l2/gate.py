@@ -168,6 +168,160 @@ class RoutingProfiler:
         self._router_switch_lock = threading.Lock()
         self._router_last_switch: dict[str, float] = {}
 
+        # [走法 D 2026-09-19] 飞轮表文件监测：真表在运行中才写出来（启动时可能
+        # 只有占位表），而引擎不会自己重读文件 → 这里盯表文件的 (mtime, size)，
+        # 一变就主动 POST /moe-set-domain 热换。用户不必重启、也不必切领域。
+        # 基线在 __init__ 就登记（不是等首次检查）：表若在"启动之后、第一个请求
+        # 之前"出现（后台采集 / 手动 collect / 飞轮写出），也要能被认成变化。
+        self._table_sig: tuple[float, int] | None = self._current_table_sig()
+        self._last_table_check = 0.0
+        self._table_pushes = 0
+        # 空闲阈值：生成期每 ~50ms 就有一条日志，0.5s 足够区分"正在生成"和
+        # "请求间隙"（2.0s 太保守：1s 间隔的连续请求永远推不进去，210 实测）。
+        try:
+            self._idle_before_switch = float(
+                os.environ.get("MOE_L2_SWAP_IDLE_SEC", "0.5"))
+        except ValueError:
+            self._idle_before_switch = 0.5
+        # [2026-09-19 安全默认] 表更新自动推送默认关闭。原因：换表路径在 C++ 侧
+        # 有并发缺陷（clear()/set_layer() 直接改全局 g_router_map，而推理线程同时
+        # 读它 → 越界访问 0xc0000005；210 实测 20 轮内复现，12 轮不换表则稳定）。
+        # 飞轮修活后推送频率上升会显著提高触发概率，因此先关；等 C++ 改成
+        # "构建新表 → 原子替换" 后再打开：MOE_L2_TABLE_PUSH=1。
+        self._table_push_enabled = os.environ.get(
+            "MOE_L2_TABLE_PUSH", "").strip().lower() in ("1", "true", "on", "yes")
+        self._table_watch_thread: threading.Thread | None = None
+        self._table_watch_stop: threading.Event | None = None
+        # [2026-09-19 保护] 最近一条引擎日志的时刻：生成期间每 token 40 行日志，
+        # 日志静下来才说明引擎空闲 → 只在这时换表，避开"生成中途 clear/set_layer"
+        # 交错（210 实测：占位表 + 运行中换表 + 连续请求出现过 ggml-base.dll
+        # 0xc0000005 崩溃）。
+        self._last_log_ts = 0.0
+        try:
+            self._table_check_interval = float(
+                os.environ.get("MOE_L2_TABLE_CHECK_SEC", "10"))
+        except ValueError:
+            self._table_check_interval = 10.0
+
+    def _current_table_sig(self) -> tuple[float, int] | None:
+        """飞轮表文件的 (mtime, size)；不存在/读不到 → None。"""
+        if self.router_flywheel is None:
+            return None
+        map_path = getattr(self.router_flywheel, "map_path", None)
+        if map_path is None:
+            return None
+        try:
+            st = os.stat(map_path)
+        except OSError:
+            return None
+        return (st.st_mtime, st.st_size)
+
+    def _maybe_switch_on_new_table(self) -> bool:
+        """飞轮表文件出现/更新 → 主动热换一次（后台线程，不阻塞日志线程）。
+
+        成本：一次 os.stat（按 _table_check_interval 节流，默认 10s）。
+        返回 True 表示本轮触发了推送。
+        """
+        if self.router_flywheel is None or not self.router_server_url:
+            return False
+        now = time.time()
+        if now - self._last_table_check < self._table_check_interval:
+            return False
+        self._last_table_check = now
+
+        sig = self._current_table_sig()
+        if sig is None or sig == self._table_sig:
+            return False
+        # 引擎忙 → 推迟（表签名先不更新，下个周期再来）
+        idle_for = now - self._last_log_ts
+        if idle_for < self._idle_before_switch:
+            logger.info("Gate: engine busy (log %.1fs ago), defer table swap", idle_for)
+            return False
+        self._table_sig = sig
+
+        map_path = getattr(self.router_flywheel, "map_path", None)
+        domain = self._pick_domain_for_push(map_path)
+        if domain is None:
+            logger.info("Gate: new router table has no usable domain, skip push")
+            return False
+        if not self._router_switch_lock.acquire(blocking=False):
+            return False  # 已有换表在跑 → 下次再推（表文件签名已更新，不会漏）
+
+        def _do() -> None:
+            try:
+                self._switch_router_domain(domain)
+                self._table_pushes += 1
+                logger.info(
+                    "Gate: hot-swapped router table (domain=%s, push #%d, no restart)",
+                    domain, self._table_pushes)
+            except Exception as e:  # noqa: BLE001 - 后台线程兜底
+                logger.warning("Gate table push failed (non-fatal): %s", e)
+            finally:
+                self._router_switch_lock.release()
+
+        threading.Thread(target=_do, daemon=True,
+                         name="moe-l2-table-push").start()
+        return True
+
+    def start_table_watcher(self, interval: float | None = None):
+        """[走法 D] 独立后台线程：周期盯飞轮表文件，出现/更新就热换。
+
+        为什么不只靠日志行回调（210 实测踩到）：① 日志流只在有请求时才动，服务
+        空闲时出现真表（手动 collect / 后台采集）永远检测不到；② 检查点若正好
+        撞上领域换表的锁（请求刚开始时），那一次会被跳过，而请求结束后日志静默
+        → 再没有重试机会。独立线程 + 周期检查把这两个口子一起堵上。
+        """
+        if self.router_flywheel is None or not self.router_server_url:
+            return None
+        if not self._table_push_enabled:
+            logger.info("Gate: table auto-push disabled "
+                        "(set MOE_L2_TABLE_PUSH=1 to enable)")
+            return None
+        if self._table_watch_thread is not None:
+            return self._table_watch_thread
+        if interval is None:
+            interval = min(self._table_check_interval, 5.0) or 5.0
+        interval = float(interval)
+        self._table_watch_stop = threading.Event()
+
+        def _loop() -> None:
+            stop = self._table_watch_stop
+            while stop is not None and not stop.wait(interval):
+                try:
+                    self._maybe_switch_on_new_table()
+                except Exception as e:  # noqa: BLE001 - 后台线程兜底
+                    logger.warning("Gate table watcher failed (non-fatal): %s", e)
+
+        self._table_watch_thread = threading.Thread(
+            target=_loop, daemon=True, name="moe-l2-table-watcher")
+        self._table_watch_thread.start()
+        logger.info("Gate: router-table watcher started (every %.0fs)", interval)
+        return self._table_watch_thread
+
+    def stop_table_watcher(self) -> None:
+        if self._table_watch_stop is not None:
+            self._table_watch_stop.set()
+
+    def _pick_domain_for_push(self, map_path) -> str | None:
+        """选一个表里确实有专家的领域来推：当前领域 → dom_freq 最热 → 任意。"""
+        try:
+            with open(map_path, encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception as e:  # noqa: BLE001 - 表刚写一半/损坏都当没表
+            logger.info("Gate: cannot read new router table (%s), skip push", e)
+            return None
+        domains = d.get("domains", {})
+        if not domains:
+            return None
+        cur = str(getattr(self.router_flywheel, "_domain", "") or "")
+        if cur and cur in domains:
+            return cur
+        dom_freq = d.get("dom_freq", {}) or {}
+        for dom in sorted(dom_freq, key=lambda k: -dom_freq.get(k, 0)):
+            if dom in domains:
+                return dom
+        return sorted(domains)[0]
+
     def _schedule_router_switch(self, domain: str) -> None:
         """节流 + 互斥 + 后台执行动态换表（不阻塞请求线程）。"""
         now = time.time()
@@ -195,6 +349,7 @@ class RoutingProfiler:
         m = _EXPERT_LINE_RE.match(line.strip())
         if not m:
             return
+        self._last_log_ts = time.time()  # 引擎在干活（换表保护用）
         layer = int(m.group(1))
         body = m.group(3)
         self._log_lines += 1
@@ -214,6 +369,8 @@ class RoutingProfiler:
         if self._log_lines % 40 == 0:
             self._maybe_promote()
             self._detect_drift()
+            # [走法 D 2026-09-19] 顺带盯一眼飞轮表文件（内部按 10s 节流 + os.stat）
+            self._maybe_switch_on_new_table()
 
         # [moe-l2 2026-08-09] 路由表数据飞轮：真实路由 → 按领域聚合
         if self.router_flywheel is not None:

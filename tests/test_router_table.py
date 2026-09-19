@@ -162,8 +162,19 @@ def test_build_router_map_file_with_existing_table(tmp_path, monkeypatch):
     assert len(lines[1].split()) == 6
 
 
-def test_build_router_map_file_no_table_no_cli(tmp_path, capsys):
+def test_build_router_map_file_no_table_skips_collect_by_default(tmp_path, capsys):
+    """[2026-09-19 决策] 冷启动采集默认关闭：无表 → 直接 on-demand，不跑 llama-cli。"""
     out = build_router_map_file("missing.gguf", data_dir=tmp_path, vram_budget_gb=50.0)
+    assert out is None
+    captured = capsys.readouterr().out
+    assert "跳过冷启动采集" in captured
+    assert "无路由表且无 llama-cli" not in captured  # 不再进可执行文件探测那条老路径
+
+
+def test_build_router_map_file_auto_collect_optin_still_falls_back(tmp_path, capsys):
+    """allow_auto_collect=True（CLI --auto-collect）仍走老路径；无可用 llama-cli 时降级提示。"""
+    out = build_router_map_file("missing.gguf", data_dir=tmp_path, vram_budget_gb=50.0,
+                                allow_auto_collect=True, llama_cli="")
     assert out is None
     assert "无路由表且无 llama-cli" in capsys.readouterr().out
 
@@ -176,3 +187,68 @@ def test_build_router_map_file_tiny_budget_on_demand(tmp_path):
     # budget below min tier (30 experts × 2 layers × 3 / 1000 × 0.82 ≈ 0.15GB)
     out = build_router_map_file("ds.gguf", data_dir=tmp_path, vram_budget_gb=0.01)
     assert out is None
+
+
+# ── [走法 D 2026-09-19] 占位路由表 ─────────────────────────────────
+
+def test_write_placeholder_router_map_header_only(tmp_path):
+    from moe_l2.router_table import write_placeholder_router_map
+
+    out = write_placeholder_router_map(4000)
+    try:
+        assert out.endswith(".router.map")
+        with open(out, encoding="utf-8") as f:
+            content = f.read()
+        # 只有元数据头、没有层数据：引擎会打开 selective-pin 开关但不 pin 任何专家
+        assert content == "# EXPERT_TOTAL 4000\n"
+        assert len(content.strip().splitlines()) == 1
+    finally:
+        os.unlink(out)
+
+
+def test_write_placeholder_router_map_clamps_to_min_one():
+    from moe_l2.router_table import write_placeholder_router_map
+
+    out = write_placeholder_router_map(0)
+    try:
+        with open(out, encoding="utf-8") as f:
+            assert f.read() == "# EXPERT_TOTAL 1\n"
+    finally:
+        os.unlink(out)
+
+
+def test_placeholder_router_map_for_uses_vram_slots(monkeypatch, capsys):
+    from moe_l2 import vram_adaptive
+    from moe_l2.router_table import placeholder_router_map_for
+
+    monkeypatch.setattr(vram_adaptive, "auto_cache_slots", lambda *a, **kw: 18045)
+    out = placeholder_router_map_for("m.gguf", 32768)
+    assert out is not None
+    try:
+        with open(out, encoding="utf-8") as f:
+            # 槽数 ÷ 3 张量（gate/up/down）→ 表里写专家数
+            assert f.read() == f"# EXPERT_TOTAL {18045 // 3}\n"
+        assert "占位路由表" in capsys.readouterr().out
+    finally:
+        os.unlink(out)
+
+
+def test_placeholder_router_map_for_none_when_budget_unknown(monkeypatch, capsys):
+    from moe_l2 import vram_adaptive
+    from moe_l2.router_table import placeholder_router_map_for
+
+    monkeypatch.setattr(vram_adaptive, "auto_cache_slots", lambda *a, **kw: None)
+    assert placeholder_router_map_for("m.gguf", 32768) is None
+    assert "占位表跳过" in capsys.readouterr().out
+
+
+def test_placeholder_router_map_for_none_when_probe_raises(monkeypatch):
+    from moe_l2 import vram_adaptive
+    from moe_l2.router_table import placeholder_router_map_for
+
+    def _boom(*a, **kw):
+        raise RuntimeError("no nvidia-smi")
+
+    monkeypatch.setattr(vram_adaptive, "auto_cache_slots", _boom)
+    # 探测失败只降级、不抛异常（启动不能被它拦住）
+    assert placeholder_router_map_for("m.gguf", 32768) is None

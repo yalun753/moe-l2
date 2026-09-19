@@ -272,10 +272,18 @@ def build_router_map_file(model_path: str, router_top_k: int = 75,
                           llama_cli: str | None = None,
                           coverage_target: float = 0.90,
                           vram_budget_gb: float | None = None,
-                          hot_domains: list[str] | None = None) -> str | None:
+                          hot_domains: list[str] | None = None,
+                          allow_auto_collect: bool = False) -> str | None:
     """start 时调用的主入口：
     1. 按模型找表（有 → 用）
-    2. 无表 → 自动收集 → 生成
+    2. 无表 → 默认**不**跑冷启动采集（allow_auto_collect=True 才跑，见下）
+       → 直接返回 None，服务以 on-demand 形态启动；路由表交给飞轮用真实
+       请求聚合生成（写 domain_router_map_flywheel_*.json，下次 start 生效），
+       或用户手动 `moe-l2 collect`。
+       [2026-09-19 决策] 冷启动采集默认关闭：它用 llama-cli 纯 CPU 跑大模型
+       （210 实测 11.5GB 模型上连第一个样本都跑不完），换来的只是一张由 3 条
+       通用样本 × 20 token 拼出来的粗糙种子表；飞轮的表来自用户真实流量，
+       更准且不阻塞启动。代价 = 头一批请求没有 selective pin 预置热专家。
     3. 显存预算 → 热门领域数 N（N=0 时纯 on-demand）
     4. 热门领域（热度榜前 N）→ 覆盖率 top-k 截断
     5. 生成 router.map 临时文件（C++ MOE_L2_ROUTER_FILE 格式）
@@ -319,6 +327,13 @@ def build_router_map_file(model_path: str, router_top_k: int = 75,
 
     # ---- 找表 / 自动收集 ----
     if table_path is None:
+        if not allow_auto_collect:
+            print("  [router] 无路由表 → 跳过冷启动采集（已默认关闭）：本次以 on-demand "
+                  "形态启动（专家按需搬运，热专家由 A3 cache 自然累积）。")
+            print("  [router] 路由表交给飞轮用真实请求生成（攒够记录后写 "
+                  "domain_router_map_flywheel_*.json，下次启动即带 selective pin）；"
+                  "想立刻生成可手动跑 `moe-l2 collect`。")
+            return None
         if llama_cli is None:
             bin_dir = Path(__file__).resolve().parent / "bin"
             # [merge/sagasm 2026-09-15] Windows 包里的二进制是 llama-cli.exe，原来
@@ -387,3 +402,51 @@ def build_router_map_file(model_path: str, router_top_k: int = 75,
     print(f"  selective pin: router map = {tmp.name} ({len(layers)} layers, "
           f"{total_experts} experts, top-k≤{router_top_k})")
     return tmp.name
+
+
+# ── [2026-09-19 走法 D] 占位路由表：无真表也能开启"运行中换表" ──────────────
+#
+# 背景：引擎侧 selective-pin / 换表路径由一个启动时定死的开关 g_router_mode
+# 控制，它只看 MOE_L2_ROUTER_FILE 是否非空（不看文件内容）。没有真表时若干脆
+# 不设这个环境变量，整条路径关闭 → 之后飞轮写出表也没法热加载，只能重启进程。
+#
+# 所以无真表时给引擎一张"只带元数据头、不含专家"的占位表：
+#   * 开关打开 → 运行中 /moe-set-domain 可用（Python 端推专家列表，引擎清旧表、
+#     按新表规模 soft_resize 缓存、重置预热标记）→ 真表生成后立刻生效，不重启；
+#   * 表内没有专家 → 启动阶段不 pin 任何专家（等价 on-demand 起步，不虚高显存）；
+#   * 必须带 # EXPERT_TOTAL：C++ 用它算 A3 cache 槽数，缺了会退回
+#     "fraction × 全模型专家空间"公式（12G 卡 30720 槽 ≈ 10GB → 崩）。
+
+def write_placeholder_router_map(expert_total: int) -> str:
+    """写占位路由表（只有 # EXPERT_TOTAL 头，无层数据），返回路径。"""
+    total = max(1, int(expert_total))
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".router.map", delete=False,
+                                      prefix="moe-l2-placeholder-")
+    tmp.write(f"# EXPERT_TOTAL {total}\n")
+    tmp.close()
+    print(f"  [router] 占位路由表 = {tmp.name}（EXPERT_TOTAL {total}，无专家："
+          f"先 on-demand 起步，真表生成后由 gate 热换，无需重启）")
+    return tmp.name
+
+
+def placeholder_router_map_for(model_path: str, n_ctx: int,
+                               kv_type_k: str | None = None,
+                               kv_type_v: str | None = None) -> str | None:
+    """按显存预算算 A3 槽数 → 生成占位表；算不出（无 N 卡/模型信息缺失）返回 None。
+
+    None 表示调用方保持旧行为（不设 MOE_L2_ROUTER_FILE，走无表 fallback）。
+    槽数算不出时不写占位表：宁可不 pin，也不要用一个瞎猜的 # EXPERT_TOTAL
+    把缓存容量带偏。
+    """
+    try:
+        from moe_l2.vram_adaptive import auto_cache_slots
+
+        slots = auto_cache_slots(model_path, n_ctx, kv_type_k, kv_type_v)
+    except Exception as e:  # 显存探测失败不阻塞启动
+        print(f"  [router] ⚠️ 占位表跳过（槽数估算失败）：{e}")
+        return None
+    if not slots or slots <= 0:
+        print("  [router] 占位表跳过（显存预算算不出）→ 无表启动")
+        return None
+    # 槽数 = 专家数 × 3 张量（gate/up/down），表里写专家数
+    return write_placeholder_router_map(max(1, int(slots) // 3))

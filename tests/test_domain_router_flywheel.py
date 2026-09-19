@@ -13,6 +13,7 @@ def _make_flywheel(tmp_path, top_k=5, rebuild_every=20, min_records=5):
         top_k=top_k,
         rebuild_every=rebuild_every,
         min_records=min_records,
+        rebuild_min_interval=0,   # 单测不关心限流，只看逻辑
     )
     return fw, map_path
 

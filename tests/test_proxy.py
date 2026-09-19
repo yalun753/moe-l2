@@ -228,3 +228,29 @@ class TestNoCache:
         assert r is not None and r.json()["cache_active"] is False
         r = httpx.get(f"{base}/stats", timeout=5)
         assert r.status_code == 503
+
+
+# ── [sagasm C1 2026-09-19] /v1/models 短名改写 ─────────────────────
+
+def test_rewrite_model_ids_with_alias():
+    from moe_l2.proxy import rewrite_model_ids
+
+    payload = {"object": "list", "data": [{"id": "D:/models/qwen.gguf"}, {"id": "x"}]}
+    out = rewrite_model_ids(payload, "qwen3-35b")
+    assert [m["id"] for m in out["data"]] == ["qwen3-35b", "qwen3-35b"]
+
+
+def test_rewrite_model_ids_without_alias_passthrough():
+    from moe_l2.proxy import rewrite_model_ids
+
+    payload = {"data": [{"id": "D:/models/qwen.gguf"}]}
+    assert rewrite_model_ids(payload, None)["data"][0]["id"] == "D:/models/qwen.gguf"
+    assert rewrite_model_ids(payload, "")["data"][0]["id"] == "D:/models/qwen.gguf"
+
+
+def test_rewrite_model_ids_tolerates_weird_payload():
+    from moe_l2.proxy import rewrite_model_ids
+
+    assert rewrite_model_ids(None, "a") is None
+    assert rewrite_model_ids({"data": "not-a-list"}, "a") == {"data": "not-a-list"}
+    assert rewrite_model_ids({"nope": 1}, "a") == {"nope": 1}

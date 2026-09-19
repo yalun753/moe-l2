@@ -345,6 +345,28 @@ def _start_llama_server(
         except Exception as e:  # 自动计算失败不阻塞启动
             print(f"  [cache] ⚠️ 槽数自动计算失败，用引擎默认：{e}")
 
+    # [走法 D 2026-09-19] 无真表 → 用占位表启动，把引擎侧"运行中换表"开关打开
+    # （g_router_mode 只看 MOE_L2_ROUTER_FILE 非空）。占位表不带专家：启动阶段
+    # 不 pin 任何专家（等价 on-demand），真表（飞轮/手动 collect）生成后由 gate
+    # 主动推 /moe-set-domain 热换 → 用户不用重启。这是"启动不卡 + 开箱即快"
+    # 能同时成立的关键：表什么时候有都行，引擎随时能接。
+    if router_map is None:
+        # [2026-09-19 默认关闭] 占位表在"空表 → 运行中第一次填表 + 连续请求"的组合下
+        # 出现过 llama-server 崩溃（ggml-base.dll / 0xc0000005，210 实测）。定位清楚
+        # 之前默认不启用；想试用设 MOE_L2_PLACEHOLDER_TABLE=1。
+        if os.environ.get("MOE_L2_PLACEHOLDER_TABLE", "").strip().lower() in ("1", "true", "on", "yes"):
+            from moe_l2.router_table import placeholder_router_map_for
+
+            router_map = placeholder_router_map_for(model_path, int(n_ctx or 8192),
+                                                    cache_type_k, cache_type_v)
+            if router_map:
+                env["MOE_L2_ROUTER_FILE"] = router_map
+                print("  selective pin: 占位表模式（MOE_L2_PLACEHOLDER_TABLE=1 显式开启；"
+                      "先 on-demand 起步，真表生成后自动热换）")
+        else:
+            print("  selective pin: 无路由表 → 无表形态启动"
+                  "（占位表默认关闭，试运行设 MOE_L2_PLACEHOLDER_TABLE=1）")
+
     cmd += ["-c", str(n_ctx)]
     # [merge/sagasm 2026-09-15] KV 量化透传：长上下文在 11-22GB 卡上的前提
     # （30B-A3B 的 f16 KV 在 256K 下约 24GB，物理放不下）。不传则维持 f16。
@@ -378,31 +400,66 @@ def _start_llama_server(
 
 
 class _GateReaderThread:
-    """读 llama-server stderr，把 EXPERT 路由日志喂给 RoutingProfiler。
+    """跟随 llama-server 日志文件，把 EXPERT 路由日志喂给 RoutingProfiler。
 
-    守护线程：llama-server 退出或 proxy 停止时自动结束。
+    [fix 2026-09-19 关键] 引擎输出早就重定向到日志文件（不是 PIPE——Windows 上
+    未读的 4KB 管道会写满并把模型加载卡死），但 reader 一直读 proc.stderr，而
+    那个永远是 None → gate 的日志解析（飞轮聚合 / 漂移检测 / promote）在所有
+    平台上都没工作过。210 实测铁证：引擎日志 15 万行 EXPERT，飞轮记录 0、
+    路由表永不写出、data 里只有一张改了名的孤儿表。
+    现在改成 tail 日志文件：从启动那一刻的末尾开始读，只处理新行。
+
+    守护线程：proxy 停止/进程退出时自动结束。
     """
 
-    def __init__(self, proc: subprocess.Popen, gate):
+    def __init__(self, proc: subprocess.Popen, gate, log_path=None):
         self._proc = proc
         self._gate = gate
+        self._log_path = Path(log_path) if log_path is not None else _LLAMA_SERVER_LOG
         self._stop = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def _run(self) -> None:
-        import select as _select
+        fh = None
         while not self._stop:
-            try:
-                r, _, _ = _select.select([self._proc.stderr], [], [], 0.5)
-                if not r:
+            if fh is None:
+                try:
+                    fh = open(self._log_path, "r",
+                              encoding="utf-8", errors="replace")
+                    fh.seek(0, os.SEEK_END)  # 只看启动后的新行，不重放历史
+                except OSError:
+                    time.sleep(0.5)
                     continue
-                line = self._proc.stderr.readline()
-                if not line:
-                    break  # stderr 关闭（llama-server 退出）
-                self._gate.on_log_line(line.decode(errors="replace"))
+            try:
+                line = fh.readline()
+            except (OSError, ValueError):
+                fh = None
+                time.sleep(0.5)
+                continue
+            if not line:
+                time.sleep(0.1)
+                # 日志被别人清空/轮转 → 重新打开
+                try:
+                    if self._log_path.stat().st_size < fh.tell():
+                        fh.close()
+                        fh = None
+                except OSError:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+                    fh = None
+                continue
+            try:
+                self._gate.on_log_line(line)
+            except Exception as e:  # 单行解析失败不该带走整个线程
+                logger.warning("Gate reader line failed (non-fatal): %s", e)
+        if fh is not None:
+            try:
+                fh.close()
             except Exception:
-                break
+                pass
 
     def stop(self) -> None:
         self._stop = True
@@ -437,6 +494,14 @@ def main():
     from moe_l2.console import enable_safe_console
 
     enable_safe_console()
+    # [sagasm C3 2026-09-19] enable_safe_console 只管编码，这里补行缓冲：
+    # stdout/stderr 重定向到文件时默认块缓冲，日志会"停更"，排障看不到实时进度
+    # （今天实测踩过：后台脚本输出卡在缓冲里，看着像卡死）。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError, OSError):
+            pass
     parser = argparse.ArgumentParser(
         prog="moe-l2",
         description="MoE inference L2 hot-cache scheduler",
@@ -524,6 +589,27 @@ def main():
             "[moe-l2 2026-08-13] Coverage target for auto router map (default: 0.90). "
             "top-k derived from measured coverage curve (80%%->30, 85%%->50, "
             "90%%->75, 95%%->100), then clamped by VRAM budget."
+        ),
+    )
+    start_parser.add_argument(
+        "--alias",
+        type=str,
+        default=None,
+        help=(
+            "[sagasm C1 2026-09-19] Short model name returned by GET /v1/models "
+            "(e.g. 'qwen3-35b'). Clients that probe /v1/models then see a usable id "
+            "instead of the full GGUF path. Inference is unaffected."
+        ),
+    )
+    start_parser.add_argument(
+        "--auto-collect",
+        action="store_true",
+        help=(
+            "[moe-l2 2026-09-19] Re-enable first-run routing collection. Default OFF: "
+            "when no router table exists, start goes straight to on-demand mode and the "
+            "flywheel builds the table from real traffic. Turning this on runs llama-cli "
+            "on CPU to collect 3 generic samples before serving (slow on big models: "
+            "blocked a 12G Windows box for minutes)."
         ),
     )
     start_parser.add_argument(
@@ -1008,7 +1094,8 @@ def cmd_start(args):
         print("Connect your client to http://127.0.0.1:{}".format(args.port))
         print("Press Ctrl+C to stop")
         try:
-            start_proxy(port=args.port, cache=None, backend_url=backend_url, gate=gate)
+            start_proxy(port=args.port, cache=None, backend_url=backend_url, gate=gate,
+                        model_alias=getattr(args, "alias", None))
         except KeyboardInterrupt:
             pass
         return 0
@@ -1109,6 +1196,7 @@ def cmd_start(args):
                     router_top_k=router_top_k,
                     data_dir=data_dir,
                     coverage_target=getattr(args, "coverage_target", 0.90),
+                    allow_auto_collect=getattr(args, "auto_collect", False),
                 )
             if getattr(args, "ctx_force", False) and getattr(args, "ctx_size", None) is None:
                 print("  [ctx-force] --ctx-force 不带 --ctx-size 时无意义"
@@ -1179,8 +1267,17 @@ def cmd_start(args):
                 router_server_url=backend_url,
             )
             gate_thread = _spawn_gate_reader(llama_proc, gate)
+            # [走法 D 2026-09-19] 独立看门线程：飞轮表一出现/更新就热换，不依赖
+            # 请求流量（服务空闲时生成的真表也能接管），且不跟换表锁抢一次就作废。
+            try:
+                gate.start_table_watcher()
+            except Exception as e:
+                logger.warning("Gate table watcher start failed (non-fatal): %s", e)
             print("  gate:     online routing adaptation (LLAMA_EXPERT_LOG) enabled")
             print(f"  flywheel: router map auto-rebuild (domain_router_map_flywheel_{_fw_model_id}.json)")
+            if not getattr(gate, "_table_push_enabled", False):
+                print("  flywheel: ⚠️ 表更新自动推送已关闭（MOE_L2_TABLE_PUSH=1 可开）"
+                      "——换表路径 C++ 侧有并发缺陷待修，新表将在下次启动生效")
         except Exception as e:
             logger.warning("Gate init failed (non-fatal): %s", e)
             gate = None
@@ -1192,7 +1289,8 @@ def cmd_start(args):
     print("Press Ctrl+C to stop")
 
     try:
-        start_proxy(port=args.port, cache=cache, backend_url=backend_url, gate=gate)
+        start_proxy(port=args.port, cache=cache, backend_url=backend_url, gate=gate,
+                    model_alias=getattr(args, "alias", None))
     except KeyboardInterrupt:
         pass
     finally:
