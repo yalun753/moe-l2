@@ -290,7 +290,11 @@ def estimate_fixed_vram_gb(model_path: str) -> float:
 # CRT fail-fast（事件日志 0xc0000409 / ucrtbase.dll），整个 llama-server 消失。
 # 这里按显存预算算出槽数交给引擎（cache 懒分配，只在填满时才有影响）。
 EXPERT_CACHE_MAX_SLOTS = 32768   # 与 expert-cache.cuh 的 EXPERT_CACHE_MAX_SLOTS 一致
-EXPERT_CACHE_SAFETY = 0.85       # 撞顶余量（碎片 / prefill 峰值）
+# 撞顶余量：留给碎片 / prefill 峰值 / 并发多 slot。210 实测锚点（2026-09-19，12G 卡 +
+# 32768 ctx + 并发探针）：18000 槽稳定、23240 槽必崩（填满后 host bad_alloc ->
+# CRT fail-fast，0xc0000409）。0.66 在 12G + Qwen3.6-35B IQ2（337KB/槽）上算出
+# 18045 槽 ≈ 实测安全点；0.85 会算到 23240，实测越线。
+EXPERT_CACHE_SAFETY = 0.66
 
 
 @functools.lru_cache(maxsize=8)

@@ -362,7 +362,8 @@ def test_auto_cache_slots_budget_on_12g(monkeypatch):
     kv_gb = 32768 * 23552.0 / 1024 ** 3
     expected = int(((free_gb - fixed_gb - kv_gb) * va.EXPERT_CACHE_SAFETY) * 1024 ** 3 / 326000.0)
     assert slots == expected
-    assert 20000 < slots < 28000
+    # 210 实测锚点：18000 稳定 / 23240 崩 -> 自动值必须落在崩点以下
+    assert 15000 < slots < 21000
 
 
 def test_auto_cache_slots_clamped_to_engine_max(monkeypatch):
