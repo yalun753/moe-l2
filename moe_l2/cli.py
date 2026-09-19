@@ -327,6 +327,24 @@ def _start_llama_server(
         n_ctx = n_ctx or 8192
         n_parallel = n_parallel or 1
 
+    # [cache-slots-autoinject 2026-09-19] 无路由表时引擎会走 expert-cache.cu 的
+    # fallback 公式（fraction x n_expert x 3 x n_layers，fraction=1）——210 实测
+    # 30720 槽 ≈ 10GB，12G 卡填满即撞顶 -> bad_alloc -> CRT fail-fast（0xc0000409），
+    # 整个 llama-server 消失。这里按显存预算注入槽数；有路由表时不注入（那种情况
+    # 引擎用表里的 # EXPERT_TOTAL，已是 Python 侧按预算收敛过的值）。
+    # 用户显式设置 MOE_L2_CACHE_SLOTS 时优先，不覆盖。
+    if router_map is None and "MOE_L2_CACHE_SLOTS" not in env:
+        try:
+            from moe_l2.vram_adaptive import auto_cache_slots
+
+            _slots = auto_cache_slots(model_path, n_ctx, cache_type_k, cache_type_v)
+            if _slots:
+                env["MOE_L2_CACHE_SLOTS"] = str(_slots)
+                print(f"  [cache] expert cache slots = {_slots}"
+                      f"（按显存预算自动；环境变量 MOE_L2_CACHE_SLOTS 可覆盖）")
+        except Exception as e:  # 自动计算失败不阻塞启动
+            print(f"  [cache] ⚠️ 槽数自动计算失败，用引擎默认：{e}")
+
     cmd += ["-c", str(n_ctx)]
     # [merge/sagasm 2026-09-15] KV 量化透传：长上下文在 11-22GB 卡上的前提
     # （30B-A3B 的 f16 KV 在 256K 下约 24GB，物理放不下）。不传则维持 f16。

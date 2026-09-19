@@ -116,7 +116,7 @@ def _model_facts(model_path: str) -> dict:
       non_expert_bytes: int   非专家权重字节数（→ 固定显存开销）
     """
     facts: dict = {"meta": {}, "context_length": None, "n_kv_layers": None,
-                   "n_layers": None, "non_expert_bytes": 0}
+                   "n_layers": None, "non_expert_bytes": 0, "expert_bytes": 0}
     try:
         from gguf import GGUFReader  # 与 gguf_reader.py 同一依赖
         reader = GGUFReader(model_path)
@@ -146,7 +146,8 @@ def _model_facts(model_path: str) -> dict:
                         "attention.key_length": "key_length",
                         "attention.value_length": "value_length",
                         "full_attention_interval": "full_attention_interval",
-                        "embedding_length": "embedding_length"}
+                        "embedding_length": "embedding_length",
+                        "expert_count": "expert_count"}
             for field, norm in norm_map.items():
                 v = _get(f"{arch}.{field}")
                 if v is not None:
@@ -164,6 +165,7 @@ def _model_facts(model_path: str) -> dict:
         kv_layers: set[int] = set()
         n_layers = 0
         non_expert = 0
+        expert_bytes = 0
         for t in reader.tensors:
             name = t.name
             if name.startswith("blk."):
@@ -174,12 +176,16 @@ def _model_facts(model_path: str) -> dict:
                     li = -1
                 if name.endswith(("attn_k.weight", "attn_v.weight")) and li >= 0:
                     kv_layers.add(li)
+            _nbytes = int(getattr(t, "n_bytes", 0) or 0)
             if _EXPERT_NAME_MARK not in name:
-                non_expert += int(getattr(t, "n_bytes", 0) or 0)
+                non_expert += _nbytes
+            else:
+                expert_bytes += _nbytes
 
         facts["meta"] = meta
         facts["n_layers"] = n_layers or meta.get("block_count") or None
         facts["non_expert_bytes"] = non_expert
+        facts["expert_bytes"] = expert_bytes
         ctx_len = meta.get("context_length")
         facts["context_length"] = int(ctx_len) if ctx_len else None
         if kv_layers:
@@ -272,6 +278,67 @@ def estimate_fixed_vram_gb(model_path: str) -> float:
     if non_expert <= 0:
         return FIXED_VRAM_GB_FALLBACK
     return non_expert / 1024 ** 3 + BUFFER_OVERHEAD_GB
+
+
+# --- [cache-slots-autoinject 2026-09-19] A3 expert cache 槽数自动计算 ---
+# 背景（210 实测 2026-09-19）：引擎侧槽数取值顺序见 llama.cpp
+# ggml/src/ggml-cuda/expert-cache.cu ---
+#   MOE_L2_CACHE_SLOTS > 路由表 "# EXPERT_TOTAL n" x3 > fraction x n_expert x 3 x n_layers
+# 无路由表时走最后一条：fraction 由 GGML_CUDA_EXPERT_CACHE 给（cli 固定传 1），
+# n_expert=256 / n_layers=40 -> 30720 槽；每槽实测约 326KB -> 约 10GB，
+# 12G 卡请求把 cache 填满即撞顶 -> host 分配失败 -> C++ bad_alloc 未捕获 ->
+# CRT fail-fast（事件日志 0xc0000409 / ucrtbase.dll），整个 llama-server 消失。
+# 这里按显存预算算出槽数交给引擎（cache 懒分配，只在填满时才有影响）。
+EXPERT_CACHE_MAX_SLOTS = 32768   # 与 expert-cache.cuh 的 EXPERT_CACHE_MAX_SLOTS 一致
+EXPERT_CACHE_SAFETY = 0.85       # 撞顶余量（碎片 / prefill 峰值）
+
+
+@functools.lru_cache(maxsize=8)
+def estimate_expert_bytes_per_slot(model_path: str) -> float:
+    """单个 cache 槽的字节数 = expert 张量总字节 / (n_expert x n_layers x 3)。
+
+    3 = 每个专家 gate/up/down 三张量（与引擎里 n_slots/3 的口径一致）。
+    读不到张量表 / expert_count -> 0.0（调用方据此不注入，保持引擎默认）。
+    """
+    facts = _model_facts(model_path)
+    n_layers = facts.get("n_layers") or 0
+    n_expert = (facts.get("meta") or {}).get("expert_count") or 0
+    total = facts.get("expert_bytes") or 0
+    if not (n_layers and n_expert and total):
+        return 0.0
+    return float(total) / (float(n_expert) * float(n_layers) * 3.0)
+
+
+def auto_cache_slots(
+    model_path: str,
+    n_ctx: int,
+    kv_type_k: str | None = None,
+    kv_type_v: str | None = None,
+    safety: float = EXPERT_CACHE_SAFETY,
+) -> int | None:
+    """按显存预算算 A3 expert cache 槽数（仅在无路由表时由 cli 注入）。
+
+    预算 = (可用显存 - 模型非专家固定开销 - 本次 n_ctx 的 KV) x safety
+    槽数 = 预算 / 每槽字节，clamp 到 [1, EXPERT_CACHE_MAX_SLOTS]。
+    任一输入缺失（无 N 卡 / 模型信息读不到）-> None：调用方不注入，保持引擎默认。
+    """
+    per_slot = estimate_expert_bytes_per_slot(model_path)
+    if per_slot <= 0:
+        return None
+    _total_mb, free_mb = probe_vram_mb()
+    if free_mb <= 0:
+        return None
+    kv_per_token = estimate_kv_bytes_per_token(model_path, kv_type_k, kv_type_v)
+    if kv_per_token <= 0:
+        return None
+    free_gb = free_mb / 1024.0
+    fixed_gb = estimate_fixed_vram_gb(model_path)
+    kv_gb = (float(n_ctx) * kv_per_token) / 1024 ** 3
+    budget_gb = (free_gb - fixed_gb - kv_gb) * safety
+    if budget_gb <= 0:
+        return None
+    slots = int(budget_gb * 1024 ** 3 / per_slot)
+    return max(1, min(slots, EXPERT_CACHE_MAX_SLOTS))
 
 
 def compute_safe_params(

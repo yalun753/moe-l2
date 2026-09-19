@@ -298,3 +298,91 @@ def test_quantized_kv_recovers_long_ctx(monkeypatch):
                                 kv_type_k="q8_0", kv_type_v="q8_0")
     assert f16["n_ctx"] < 262144          # f16 估算放不下 → 降档（这就是那个 bug）
     assert q8["n_ctx"] > f16["n_ctx"]     # 量化 KV 后能开更大
+
+
+# ── [cache-slots-autoinject 2026-09-19] A3 expert cache 槽数自动计算 ──
+
+def test_expert_bytes_per_slot_from_facts(monkeypatch):
+    """每槽字节 = expert 张量总字节 ÷ (n_expert × n_layers × 3)。"""
+    if hasattr(va.estimate_expert_bytes_per_slot, "cache_clear"):
+        va.estimate_expert_bytes_per_slot.cache_clear()
+    facts = _facts()
+    facts["expert_bytes"] = 256 * 40 * 3 * 326000
+    facts["meta"]["expert_count"] = 256
+    monkeypatch.setattr(va, "_model_facts", lambda p: facts)
+    assert va.estimate_expert_bytes_per_slot("/qwen.gguf") == pytest.approx(326000.0)
+
+
+def test_expert_bytes_per_slot_missing_info_is_zero(monkeypatch):
+    """读不到张量表/expert_count → 0.0（调用方据此不注入）。"""
+    if hasattr(va.estimate_expert_bytes_per_slot, "cache_clear"):
+        va.estimate_expert_bytes_per_slot.cache_clear()
+    monkeypatch.setattr(va, "_model_facts", lambda p: {"meta": {}, "n_layers": 40})
+    assert va.estimate_expert_bytes_per_slot("/missing.gguf") == 0.0
+
+
+def test_expert_bytes_per_slot_from_real_gguf(tmp_path, monkeypatch):
+    """真写 GGUF 验证 expert 字节统计 + expert_count 元数据口径。"""
+    gguf = pytest.importorskip("gguf")
+    import numpy as np
+
+    path = tmp_path / "mini-expert.gguf"
+    w = gguf.GGUFWriter(str(path), "qwen35moe")
+    w.add_block_count(2)
+    w.add_uint32("qwen35moe.expert_count", 8)
+    w.add_tensor("blk.0.ffn_gate_exps.weight", np.zeros((8, 512, 2048), dtype=np.float32))
+    w.add_tensor("blk.1.ffn_up_exps.weight", np.zeros((8, 512, 2048), dtype=np.float32))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+    total_expert_bytes = 2 * 8 * 512 * 2048 * 4
+    real = _REAL_MODEL_FACTS(str(path))
+    assert real["expert_bytes"] == total_expert_bytes
+    assert real["meta"]["expert_count"] == 8
+
+    monkeypatch.setattr(va, "_model_facts", _REAL_MODEL_FACTS)
+    if hasattr(va.estimate_expert_bytes_per_slot, "cache_clear"):
+        va.estimate_expert_bytes_per_slot.cache_clear()
+    assert va.estimate_expert_bytes_per_slot(str(path)) == pytest.approx(
+        total_expert_bytes / (8 * 2 * 3)
+    )
+
+
+def test_auto_cache_slots_budget_on_12g(monkeypatch):
+    """12G 卡 / IQ2（326KB 每槽）→ 落在合理档，既不是引擎 fallback 的 30720 也不是兜底 8192。"""
+    monkeypatch.setattr(va, "estimate_expert_bytes_per_slot", lambda p: 326000.0)
+    monkeypatch.setattr(va, "estimate_fixed_vram_gb", lambda p: 1.69)
+    monkeypatch.setattr(va, "probe_vram_mb", lambda: (12288, 11255))
+    monkeypatch.setattr(va, "estimate_kv_bytes_per_token", lambda p, k=None, v=None: 23552.0)
+
+    slots = va.auto_cache_slots("/qwen.gguf", 32768)
+    free_gb, fixed_gb = 11255 / 1024.0, 1.69
+    kv_gb = 32768 * 23552.0 / 1024 ** 3
+    expected = int(((free_gb - fixed_gb - kv_gb) * va.EXPERT_CACHE_SAFETY) * 1024 ** 3 / 326000.0)
+    assert slots == expected
+    assert 20000 < slots < 28000
+
+
+def test_auto_cache_slots_clamped_to_engine_max(monkeypatch):
+    monkeypatch.setattr(va, "estimate_expert_bytes_per_slot", lambda p: 326000.0)
+    monkeypatch.setattr(va, "estimate_fixed_vram_gb", lambda p: 1.69)
+    monkeypatch.setattr(va, "probe_vram_mb", lambda: (49152, 46000))
+    monkeypatch.setattr(va, "estimate_kv_bytes_per_token", lambda p, k=None, v=None: 23552.0)
+    assert va.auto_cache_slots("/qwen.gguf", 32768) == va.EXPERT_CACHE_MAX_SLOTS
+
+
+def test_auto_cache_slots_none_keeps_engine_default(monkeypatch):
+    """无 N 卡 / 模型信息读不到 / ctx 吃掉全部预算 → None（不注入，行为与合并前一致）。"""
+    monkeypatch.setattr(va, "estimate_expert_bytes_per_slot", lambda p: 0.0)
+    assert va.auto_cache_slots("/x.gguf", 32768) is None
+
+    monkeypatch.setattr(va, "estimate_expert_bytes_per_slot", lambda p: 326000.0)
+    monkeypatch.setattr(va, "probe_vram_mb", lambda: (0, 0))
+    assert va.auto_cache_slots("/qwen.gguf", 32768) is None
+
+    monkeypatch.setattr(va, "probe_vram_mb", lambda: (12288, 4000))
+    monkeypatch.setattr(va, "estimate_fixed_vram_gb", lambda p: 1.69)
+    monkeypatch.setattr(va, "estimate_kv_bytes_per_token", lambda p, k=None, v=None: 23552.0)
+    assert va.auto_cache_slots("/qwen.gguf", 262144) is None
