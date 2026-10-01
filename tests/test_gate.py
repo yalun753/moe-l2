@@ -233,7 +233,9 @@ def test_switch_domain_domain_not_in_table(tmp_path, monkeypatch):
 
 # ── [走法 D 2026-09-19] 表生成后主动热换（免重启） ─────────────────
 
-def _wait_until(cond, timeout=3.0):
+def _wait_until(cond, timeout=10.0):
+    # 10s（原 3s）：推表在后台线程里跑（urlopen 已 mock，但线程调度受全量跑负载影响），
+    # 3s 在整套测试并发跑时偶发超时 → test_table_push_on_update 间歇性失败（时序 flaky）。
     deadline = time.time() + timeout
     while time.time() < deadline:
         if cond():

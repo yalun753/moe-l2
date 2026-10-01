@@ -122,12 +122,17 @@ def test_gate_reader_works_when_select_is_socket_only(monkeypatch, tmp_path):
     log.write_text("", encoding="utf-8")
     gate = _FakeGate()
     th = _GateReaderThread(None, gate, log_path=log)
-    with open(log, "a", encoding="utf-8") as f:
-        f.write("EXPERT|L0|T1: [1,2,3,4,5,6,7,8]\n")
-    for _ in range(150):
+    # 竞态：reader 线程启动时 seek 到文件末尾——若 append 发生在那之前，这一行会被当成
+    # "历史"跳过（读不到就永久等不到）。所以反复追加，每次追加都晚于 seek，直到读进来。
+    for _ in range(50):
+        with open(log, "a", encoding="utf-8") as f:
+            f.write("EXPERT|L0|T1: [1,2,3,4,5,6,7,8]\n")
+        for _ in range(10):
+            if gate.lines:
+                break
+            _time.sleep(0.02)
         if gate.lines:
             break
-        _time.sleep(0.02)
     th.stop()
     assert gate.lines, "gate reader 没喂进任何日志行"
     assert gate.lines[0].startswith("EXPERT|L0|T1:")
