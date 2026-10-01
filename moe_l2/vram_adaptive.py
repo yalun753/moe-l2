@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import functools
 import subprocess
+import sys
 
 # KV 之外给 A3 专家 cache / prefill 峰值留的份额（占可用显存）
 CACHE_RESERVE_RATIO = 0.25
@@ -294,7 +295,33 @@ EXPERT_CACHE_MAX_SLOTS = 32768   # 与 expert-cache.cuh 的 EXPERT_CACHE_MAX_SLO
 # 32768 ctx + 并发探针）：18000 槽稳定、23240 槽必崩（填满后 host bad_alloc ->
 # CRT fail-fast，0xc0000409）。0.66 在 12G + Qwen3.6-35B IQ2（337KB/槽）上算出
 # 18045 槽 ≈ 实测安全点；0.85 会算到 23240，实测越线。
+# ⚠️ 这套参数是 Windows（WDDM：显存不够会向系统内存超额分页）上校准的。
 EXPERT_CACHE_SAFETY = 0.66
+
+# ── [2026-10-01 Linux 实测校准] ────────────────────────────────────────────────
+# 背景：Linux 上 cudaMalloc 是硬限制（没有 WDDM 那种超额分页兜底），超了直接
+# `CUDA error: out of memory` -> ggml_abort，进程消失。旧公式沿用 Windows 参数，
+# 在 12G 卡上按 19987 槽下发，实测必崩（峰值顶到 12042 MiB / 上限 12288）。
+# 实测环境：AutoDL RTX 3080Ti 12G + Qwen3.6-35B-A3B-UD-IQ2_M(UD-IQ2_M, 11.5GB)
+#   占位表模式（零换表，隔离变量），workload = 每轮 2600 token 连续长生成
+#   加载后基线（含 KV@32768）= 4000 MiB；KV 增量实测 ≈20.5 KB/tok
+#   （256K 档基线 8704 MiB，与 262144×20.5KB ≈ 5.4GB 吻合；公式 23KB/tok 偏保守 12%）
+#   峰值-基线 对槽数近线性（MiB）：6000→3054 / 8000→4410 / 12000→6662 / 14000→7340
+#     -> 实测 ~0.53 MiB/槽（旧公式按 GGUF 张量表估 310KB/槽，低估 ~1.75x）
+#   固定开销实测 ~3.3GB（旧公式估 2.08GB，低估 ~1.2GB）
+#   两处低估叠加 -> 12G/32K 多算约 1.5 倍槽数 -> Linux 必炸
+# 校准结果（实测）：12G/32K 用 12000 槽峰值 10662 MiB（余 1.6GB，命中率 90.5%、
+#   36 t/s）、14000 槽峰值 11340 MiB（余 950MiB、命中率 93.8%、38.7 t/s）、
+#   19987 槽 OOM；12G/256K 用 4000 槽峰值 10370 MiB（余 1.9GB、22.4 t/s、命中率 65.7%）、
+#   6000 槽峰值 11752 MiB（余 536MiB、23.3 t/s、75.7%）。
+LINUX_SLOT_MIB = 0.53          # Linux 实测每槽占用（MiB）
+LINUX_FIXED_VRAM_GB = 3.3      # Linux 实测加载后固定开销（非专家权重 + 缓冲）
+LINUX_CACHE_MARGIN_GB = 1.3    # 撞顶余量（碎片 / prefill 峰值 / 并发 slot）
+
+
+def _linux_hard_vram_limit(platform: str | None = None) -> bool:
+    """Linux 上显存是硬限制（cudaMalloc 失败即 abort），预算必须按上限反解。"""
+    return (platform or sys.platform).lower().startswith("linux")
 
 
 @functools.lru_cache(maxsize=8)
@@ -319,12 +346,16 @@ def auto_cache_slots(
     kv_type_k: str | None = None,
     kv_type_v: str | None = None,
     safety: float = EXPERT_CACHE_SAFETY,
+    platform: str | None = None,
 ) -> int | None:
     """按显存预算算 A3 expert cache 槽数（仅在无路由表时由 cli 注入）。
 
-    预算 = (可用显存 - 模型非专家固定开销 - 本次 n_ctx 的 KV) x safety
-    槽数 = 预算 / 每槽字节，clamp 到 [1, EXPERT_CACHE_MAX_SLOTS]。
-    任一输入缺失（无 N 卡 / 模型信息读不到）-> None：调用方不注入，保持引擎默认。
+    Linux（cudaMalloc 硬失败）：按"实测占用 = 固定开销 + KV + 槽数×每槽实占 + 余量
+      ≤ 可用显存"反解，常量取 2026-10-01 12G 卡实测值（见上方注释）。
+    其它平台（Windows/WDDM 可超额分页）：沿用 2026-09-19 的 210 校准口径
+      = (可用显存 - 模型非专家固定开销 - KV) x safety / 每槽字节。
+
+    预算算不出/读不到模型信息 -> None：调用方不注入，保持引擎默认。
     """
     per_slot = estimate_expert_bytes_per_slot(model_path)
     if per_slot <= 0:
@@ -336,12 +367,18 @@ def auto_cache_slots(
     if kv_per_token <= 0:
         return None
     free_gb = free_mb / 1024.0
-    fixed_gb = estimate_fixed_vram_gb(model_path)
     kv_gb = (float(n_ctx) * kv_per_token) / 1024 ** 3
-    budget_gb = (free_gb - fixed_gb - kv_gb) * safety
-    if budget_gb <= 0:
-        return None
-    slots = int(budget_gb * 1024 ** 3 / per_slot)
+    if _linux_hard_vram_limit(platform):
+        budget_gb = free_gb - LINUX_FIXED_VRAM_GB - kv_gb - LINUX_CACHE_MARGIN_GB
+        if budget_gb <= 0:
+            return None
+        slots = int(budget_gb * 1024 ** 3 / (LINUX_SLOT_MIB * 1024 ** 2))
+    else:
+        fixed_gb = estimate_fixed_vram_gb(model_path)
+        budget_gb = (free_gb - fixed_gb - kv_gb) * safety
+        if budget_gb <= 0:
+            return None
+        slots = int(budget_gb * 1024 ** 3 / per_slot)
     return max(1, min(slots, EXPERT_CACHE_MAX_SLOTS))
 
 

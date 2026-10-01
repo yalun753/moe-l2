@@ -351,13 +351,13 @@ def test_expert_bytes_per_slot_from_real_gguf(tmp_path, monkeypatch):
 
 
 def test_auto_cache_slots_budget_on_12g(monkeypatch):
-    """12G 卡 / IQ2（326KB 每槽）→ 落在合理档，既不是引擎 fallback 的 30720 也不是兜底 8192。"""
+    """Windows 口径（210 校准）：12G 卡 / IQ2（326KB 每槽）→ 落在合理档。"""
     monkeypatch.setattr(va, "estimate_expert_bytes_per_slot", lambda p: 326000.0)
     monkeypatch.setattr(va, "estimate_fixed_vram_gb", lambda p: 1.69)
     monkeypatch.setattr(va, "probe_vram_mb", lambda: (12288, 11255))
     monkeypatch.setattr(va, "estimate_kv_bytes_per_token", lambda p, k=None, v=None: 23552.0)
 
-    slots = va.auto_cache_slots("/qwen.gguf", 32768)
+    slots = va.auto_cache_slots("/qwen.gguf", 32768, platform="win32")
     free_gb, fixed_gb = 11255 / 1024.0, 1.69
     kv_gb = 32768 * 23552.0 / 1024 ** 3
     expected = int(((free_gb - fixed_gb - kv_gb) * va.EXPERT_CACHE_SAFETY) * 1024 ** 3 / 326000.0)
@@ -366,12 +366,52 @@ def test_auto_cache_slots_budget_on_12g(monkeypatch):
     assert 15000 < slots < 21000
 
 
+def test_auto_cache_slots_linux_uses_measured_constants(monkeypatch):
+    """Linux 口径（2026-10-01 RTX 3080Ti 12G 实测校准）。
+
+    必须按「固定开销 3.3GB + 每槽 0.53MiB + 余量 1.3GB」反解，而不是沿用 Windows
+    的 0.66/310KB 口径（后者 12G/32K 会算到 19987 槽，实测第 4 轮 CUDA OOM）。
+    实测锚点：12000 槽峰值 10662MiB 稳 / 14000 槽峰值 11340MiB 稳（余 950MiB）/
+    19987 槽峰值顶到 12042MiB 崩。
+    """
+    monkeypatch.setattr(va, "estimate_expert_bytes_per_slot", lambda p: 326000.0)
+    monkeypatch.setattr(va, "estimate_fixed_vram_gb", lambda p: 1.69)  # 旧低估值，Linux 分支不该采用
+    monkeypatch.setattr(va, "probe_vram_mb", lambda: (12288, 12288))
+    monkeypatch.setattr(va, "estimate_kv_bytes_per_token", lambda p, k=None, v=None: 23552.0)
+
+    slots = va.auto_cache_slots("/qwen.gguf", 32768, platform="linux")
+    assert slots is not None
+    n = int(slots)
+    kv_gb = 32768 * 23552.0 / 1024 ** 3
+    expected = int((12.0 - va.LINUX_FIXED_VRAM_GB - kv_gb - va.LINUX_CACHE_MARGIN_GB)
+                   * 1024 ** 3 / (va.LINUX_SLOT_MIB * 1024 ** 2))
+    assert n == expected
+    assert 10000 <= n <= 14000          # 落在实测稳定区间
+    # 按实测斜率外推的峰值必须留在 12G 以内（基线 4000MiB + 槽数×0.53MiB）
+    assert 4000 + n * va.LINUX_SLOT_MIB < 12288
+
+
+def test_auto_cache_slots_linux_256k_ctx_shrinks_slots(monkeypatch):
+    """256K 上下文：KV 吃掉 5.7GB，槽数应大幅收缩但仍 > 0（长文档场景可跑）。"""
+    monkeypatch.setattr(va, "estimate_expert_bytes_per_slot", lambda p: 326000.0)
+    monkeypatch.setattr(va, "estimate_fixed_vram_gb", lambda p: 1.69)
+    monkeypatch.setattr(va, "probe_vram_mb", lambda: (12288, 12288))
+    monkeypatch.setattr(va, "estimate_kv_bytes_per_token", lambda p, k=None, v=None: 23552.0)
+
+    slots = va.auto_cache_slots("/qwen.gguf", 262144, platform="linux")
+    assert slots is not None
+    n = int(slots)
+    assert 2000 <= n <= 6000
+    assert 4000 + n * va.LINUX_SLOT_MIB + 262144 * 23552.0 / 1024 ** 2 < 12288
+
+
 def test_auto_cache_slots_clamped_to_engine_max(monkeypatch):
     monkeypatch.setattr(va, "estimate_expert_bytes_per_slot", lambda p: 326000.0)
     monkeypatch.setattr(va, "estimate_fixed_vram_gb", lambda p: 1.69)
     monkeypatch.setattr(va, "probe_vram_mb", lambda: (49152, 46000))
     monkeypatch.setattr(va, "estimate_kv_bytes_per_token", lambda p, k=None, v=None: 23552.0)
-    assert va.auto_cache_slots("/qwen.gguf", 32768) == va.EXPERT_CACHE_MAX_SLOTS
+    assert va.auto_cache_slots("/qwen.gguf", 32768, platform="win32") == va.EXPERT_CACHE_MAX_SLOTS
+    assert va.auto_cache_slots("/qwen.gguf", 32768, platform="linux") == va.EXPERT_CACHE_MAX_SLOTS
 
 
 def test_auto_cache_slots_none_keeps_engine_default(monkeypatch):
