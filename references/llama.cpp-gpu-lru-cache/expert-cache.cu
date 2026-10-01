@@ -382,6 +382,20 @@ const void * ggml_cuda_expert_cache_set(const void * cpu_src, size_t size, const
         CUDA_CHECK(cudaMemcpyAsync(
             slot.dev_ptr, dev_ptr, size,
             cudaMemcpyDeviceToDevice, stream));
+        // [moe-l2 2026-08-27 debug] verify D2D: read back slot vs source dev_ptr
+        { static int svdbg = 0;
+          if (svdbg < 5) {
+              static unsigned char *sb = nullptr, *db = nullptr;
+              if (!sb) { sb = new unsigned char[2*1024*1024]; db = new unsigned char[2*1024*1024]; }
+              cudaStreamSynchronize(stream);
+              cudaMemcpy(sb, slot.dev_ptr, size, cudaMemcpyDeviceToHost);
+              cudaMemcpy(db, dev_ptr, size, cudaMemcpyDeviceToHost);
+              bool svsame = memcmp(sb, db, size) == 0;
+              fprintf(stderr, "[SET-VERIFY] key=%p same=%d size=%zu slot=%p src=%p\n",
+                  cpu_src, (int)svsame, (size_t)size, (void*)slot.dev_ptr, (void*)dev_ptr);
+              svdbg++;
+          }
+        }
 
         // ── Fill slot metadata（写序：先 cpu_src，后 valid.release 发布）──
         slot.cpu_src   = cpu_src;

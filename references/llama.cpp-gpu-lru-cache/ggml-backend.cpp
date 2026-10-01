@@ -24,6 +24,8 @@
 #include <vector>
 #include <unordered_set>
 #include <chrono>
+#include <memory>   // [moe-l2 2026-10-01 原子换表] shared_ptr 快照 + atomic_load/store
+#include <mutex>    // [moe-l2 2026-10-01 原子换表] 写侧串行锁
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -33,13 +35,29 @@
 // [moe-l2 route-by-domain C 2026-08-15] 文件级 router map（原为
 // ggml_backend_sched_compute_splits 内 static，提级以便 server 按预测领域动态换表）。
 // 消费方：copy_experts 路径（selective pin + prefill），更新方：server /moe-set-domain。
-static std::vector<std::unordered_set<int32_t>> g_router_map;
+//
+// [moe-l2 2026-10-01 原子换表] Linux 侧同 Windows 补丁：全局表改为
+// "写侧构建稿 + 读侧原子快照"。旧实现 clear() 先清空全局 vector、server 再逐层
+// set_layer() 回填，推理线程同时读 g_router_map[il] → 读到 size 已缩小/半填的表
+// = 越界访问（Windows 实测 ggml-base.dll 0xc0000005 @0x175ae；Linux 未崩只是
+// clear() 保留 capacity 的 UB 侥幸）。现在 server 在最后一层填完后调 commit()
+// 一次性发布，读侧取 shared_ptr 快照后再查，旧表由引用计数保活 → 无撕裂窗口。
+using moe_router_layers_t = std::vector<std::unordered_set<int32_t>>;
+static std::shared_ptr<const moe_router_layers_t> g_router_map_snap;   // 读侧快照（原子发布）
+static std::shared_ptr<moe_router_layers_t>       g_router_map_build;  // 写侧构建中（未发布）
+static std::mutex                                 g_router_map_mu;     // 写侧串行：clear/set_layer/commit/文件加载
 static bool g_router_loaded = false;
 static bool g_router_mode = []() {
     const char * env = getenv("MOE_L2_ROUTER_FILE");
     return env && env[0] != '\0';
 }();
 static std::unordered_set<std::string> g_prefill_done;
+static std::mutex g_prefill_mu;  // [moe-l2 2026-10-01] g_prefill_done 跨请求并发读写保护
+
+// 读侧：取当前路由表快照。调用者持有 shared_ptr 期间旧表不会被释放。
+static inline std::shared_ptr<const moe_router_layers_t> moe_router_snapshot() {
+    return std::atomic_load_explicit(&g_router_map_snap, std::memory_order_acquire);
+}
 
 // [moe-l2 route-by-domain C 2026-08-15] 供 llama-server 运行时更新路由表（按领域换表）：
 //   set_layer(layer, experts, n)    —— 替换某层的专家集合（无则插入新层）
@@ -48,20 +66,44 @@ static std::unordered_set<std::string> g_prefill_done;
 extern "C" {
 void ggml_backend_router_set_layer(int layer, const int32_t * experts, int n) {
     if (layer < 0 || experts == nullptr || n <= 0) return;
-    if ((size_t) layer >= g_router_map.size()) g_router_map.resize(layer + 1);
-    auto & s = g_router_map[layer];
+    std::lock_guard<std::mutex> lk(g_router_map_mu);
+    if (!g_router_map_build) {
+        // 没先 clear()：以当前快照为底稿续写（避免"只 set 一层"把其余层清空）
+        auto snap = moe_router_snapshot();
+        g_router_map_build = snap ? std::make_shared<moe_router_layers_t>(*snap)
+                                  : std::make_shared<moe_router_layers_t>();
+    }
+    if ((size_t) layer >= g_router_map_build->size()) g_router_map_build->resize(layer + 1);
+    auto & s = (*g_router_map_build)[layer];
     s.clear();
     for (int i = 0; i < n; ++i) {
         if (experts[i] >= 0) s.insert(experts[i]);
     }
 }
 void ggml_backend_router_reset_prefill() {
+    std::lock_guard<std::mutex> lk(g_prefill_mu);
     g_prefill_done.clear();
 }
 void ggml_backend_router_clear() {
-    g_router_map.clear();
-    g_prefill_done.clear();
+    std::lock_guard<std::mutex> lk(g_router_map_mu);
+    // [moe-l2 2026-10-01 原子换表] 只丢弃"构建中"的稿子；已发布快照继续对推理线程
+    // 可见，直到 commit() 原子换表 —— 旧行为是这里就把全局表清空。
+    g_router_map_build = std::make_shared<moe_router_layers_t>();
+    {
+        std::lock_guard<std::mutex> lk2(g_prefill_mu);
+        g_prefill_done.clear();
+    }
     g_router_loaded = true;  // 阻止后续从 MOE_L2_ROUTER_FILE 重新加载覆盖新表
+}
+// [moe-l2 2026-10-01 原子换表] 换表收尾：把构建好的新表一次性发布给推理线程。
+// 必须在最后一层 set_layer() 之后调用（server /moe-set-domain 末尾）。
+void ggml_backend_router_commit() {
+    std::lock_guard<std::mutex> lk(g_router_map_mu);
+    if (!g_router_map_build) return;  // 没有构建中的新表 → 不动
+    std::shared_ptr<const moe_router_layers_t> pub = g_router_map_build;
+    std::atomic_store_explicit(&g_router_map_snap, pub, std::memory_order_release);
+    g_router_map_build.reset();
+    fprintf(stderr, "[moe-l2] router map committed: %zu layers\n", pub->size());
 }
 // [moe-l2 route-by-domain C 2026-08-15] 换表时同步调整 cache 槽数：
 // 清空释放旧槽（旧领域数据作废）并把 n_slots 设为 new_n_slots。
@@ -106,6 +148,11 @@ void ggml_backend_router_soft_resize_cache(int new_n_slots) {
 }
 }
 
+
+// [moe-l2 fix 2026-08-27] ggml_backend_dev_by_type lives in ggml-backend-reg.cpp
+// (separate ggml library target in the new repo layout). Declare it here so
+// ggml-base can resolve the symbol when linked into the final binaries.
+GGML_API ggml_backend_dev_t ggml_backend_dev_by_type(enum ggml_backend_dev_type type);
 // backend buffer type
 
 const char * ggml_backend_buft_name(ggml_backend_buffer_type_t buft) {
@@ -1709,6 +1756,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         g_router_loaded = true;
                         const char * path = getenv("MOE_L2_ROUTER_FILE");
                         FILE * rf = fopen(path, "r");
+                        // [moe-l2 2026-10-01 原子换表] 先在本地表上构建完，再原子发布
+                        auto loaded = std::make_shared<moe_router_layers_t>();
                         if (!rf) {
                             fprintf(stderr, "[moe-l2] selective pin: cannot open %s, falling back to whole-pin\n", path);
                         } else {
@@ -1721,8 +1770,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 layer = atoi(p);
                                 if (layer < 0) continue;
                                 while (*p && *p != ' ' && *p != '\t' && *p != '\n') p++;
-                                if ((size_t) layer >= g_router_map.size()) g_router_map.resize(layer + 1);
-                                auto & s = g_router_map[layer];
+                                if ((size_t) layer >= loaded->size()) loaded->resize(layer + 1);
+                                auto & s = (*loaded)[layer];
                                 while (*p) {
                                     while (*p == ' ' || *p == '\t') p++;
                                     if (*p == '\n' || *p == '\0') break;
@@ -1732,7 +1781,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 }
                             }
                             fclose(rf);
-                            fprintf(stderr, "[moe-l2] selective pin: loaded %zu layers from %s\n", g_router_map.size(), path);
+                            std::lock_guard<std::mutex> lk(g_router_map_mu);
+                            std::atomic_store_explicit(&g_router_map_snap,
+                                std::shared_ptr<const moe_router_layers_t>(loaded),
+                                std::memory_order_release);
+                            fprintf(stderr, "[moe-l2] selective pin: loaded %zu layers from %s\n", loaded->size(), path);
                         }
                     }
 
@@ -1903,6 +1956,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             return env && env[0] == '1';
                         }();
                         if (do_pin) {
+                            // [moe-l2 2026-10-01 原子换表] 取快照（shared_ptr 保活）后再查表
+                            const auto rsnap_pin = moe_router_snapshot();
                             if (g_router_mode) {
                                 // [moe-l2 selective pin 2026-08-10] pin ONLY the experts
                                 // listed in the router map for this layer. Unlisted experts
@@ -1911,8 +1966,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 // This keeps RSS at (top-K experts x layers) instead of the
                                 // whole tensor while covering ~94% of activations.
                                 const int il = router_layer_of(input);
-                                if (il >= 0 && (size_t) il < g_router_map.size()) {
-                                    const auto & rset = g_router_map[il];
+                                if (rsnap_pin && il >= 0 && (size_t) il < rsnap_pin->size()) {
+                                    const auto & rset = (*rsnap_pin)[il];
                                     if (!rset.empty()) {
                                         for (int32_t e = first_id; e <= last_id; ++e) {
                                             if (rset.count(e) > 0) {
@@ -1944,12 +1999,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // Guarded by static flag (once per tensor name).
                         {
                             const std::string tname = input->name ? input->name : "";
-                            if (g_router_mode && cache_set_fn && !tname.empty() &&
-                                g_prefill_done.count(tname) == 0) {
-                                g_prefill_done.insert(tname);
+                            // [moe-l2 2026-10-01] g_prefill_done 跨请求并发读写 → check-then-insert 加锁
+                            bool need_prefill = false;
+                            if (g_router_mode && cache_set_fn && !tname.empty()) {
+                                std::lock_guard<std::mutex> lk(g_prefill_mu);
+                                if (g_prefill_done.count(tname) == 0) {
+                                    g_prefill_done.insert(tname);
+                                    need_prefill = true;
+                                }
+                            }
+                            const auto rsnap_pf = need_prefill ? moe_router_snapshot() : nullptr;
+                            if (need_prefill) {
                                 const int il = router_layer_of(input);
-                                if (il >= 0 && (size_t) il < g_router_map.size()) {
-                                    const auto & rset = g_router_map[il];
+                                if (rsnap_pf && il >= 0 && (size_t) il < rsnap_pf->size()) {
+                                    const auto & rset = (*rsnap_pf)[il];
                                     if (!rset.empty()) {
                                         const uint64_t name_h = std::hash<std::string>{}(tname);
                                         int n_prefilled = 0;
@@ -1969,6 +2032,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                             const size_t off = (size_t) e * expert_size;
                                             const void * src_ptr = (const char *)input->data + off;
                                             void * dst_gpu = (char *)input_cpy->data + off;
+                                            // [moe-l2 2026-08-27 debug] log src/dst buffer names (no CUDA API in this TU)
+                                            {
+                                                const char * sb = input->buffer ? ggml_backend_buffer_name(input->buffer) : "null";
+                                                const char * db = input_cpy->buffer ? ggml_backend_buffer_name(input_cpy->buffer) : "null";
+                                                fprintf(stderr, "[PREFILL-DBG] e=%d off=%zu esize=%zu srcbuf=%s dstbuf=%s\n",
+                                                    (int)e, off, expert_size, sb, db);
+                                            }
                                             // H2D into the sched copy buffer...
                                             ggml_backend_tensor_set_async(split_backend,
                                                 input_cpy, (const uint8_t *)src_ptr, off,
@@ -1985,6 +2055,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                             // (reproduced with router map on
                                             // 2026-08-13).
                                             void * ps = cache_stream_fn ? cache_stream_fn(split_backend) : nullptr;
+                                            // [moe-l2 P0 fix 2026-08-27] the H2D above
+                                            // (set_async) may land on a different stream than the
+                                            // cache D2D (multi-stream rotation in newer llama.cpp).
+                                            // Sync before the D2D so the slot stores completed H2D
+                                            // data; otherwise prefill slots hold garbage and every
+                                            // later hit produces garbage output.
+                                            ggml_backend_synchronize(split_backend);
                                             cache_set_fn(
                                                 (const void *)(name_h ^ (uint64_t) e * 0x9E3779B97F4A7C15ULL),
                                                 (e == n_expert - 1) ? expert_size : expert_size + padding,
@@ -2054,6 +2131,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 probe_h2d_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - probe_t0).count();
                                 probe_h2d_bytes += copy_len;
                                 probe_miss++;
+                                // [moe-l2 2026-08-27 debug] verify H2D: read back and compare with CPU source
+                                { static int vdbg2 = 0;
+                                  if (vdbg2 < 5) {
+                                      static unsigned char rbuf2[2*1024*1024];
+                                      ggml_backend_synchronize(split_backend);
+                                      ggml_backend_tensor_get(input_cpy, rbuf2, off, expert_size);
+                                      bool same2 = memcmp(rbuf2, src_ptr, expert_size) == 0;
+                                      fprintf(stderr, "[H2D-VERIFY] name='%s' e=%d off=%zu es=%zu same=%d first=%02x%02x%02x vs %02x%02x%02x\n",
+                                          input->name ? input->name : "?", (int)e, off, expert_size, (int)same2,
+                                          rbuf2[0], rbuf2[1], rbuf2[2],
+                                          ((const unsigned char*)src_ptr)[0], ((const unsigned char*)src_ptr)[1], ((const unsigned char*)src_ptr)[2]);
+                                      vdbg2++;
+                                  }
+                                }
 
                                 // miss: write back to cache for next token
                                 // [moe-l2 2026-08-13 DS fix] slot 也按 es+padding 存，
@@ -2064,17 +2155,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 // LRU 抖动；无路由表（非 g_router_mode）时维持原行为
                                 // （全部缓存）。
                                 if (cache_set_fn) {
-                                    bool in_router = !g_router_mode;
-                                    if (g_router_mode) {
-                                        const int il0 = router_layer_of(input);
-                                        in_router = (il0 >= 0 && (size_t) il0 < g_router_map.size() &&
-                                                     g_router_map[il0].count(e) > 0);
-                                    }
-                                    if (in_router) {
+                                    // [moe-l2 2026-08-27 perf] cache EVERY activated
+                                    // expert regardless of router membership. With
+                                    // MOE_L2_N_LAYERS covering all layers (30720 slots)
+                                    // the slots are sufficient; restricting cache_set to
+                                    // in-router experts left the ~181/layer out-of-router
+                                    // experts on the slow unpinned H2D path every time.
+                                    // Caching all lets a second activation hit D2D.
+                                    const bool in_router = true;
+                                        // [moe-l2 2026-08-27 P0 fix] the H2D above
+                                        // (set_async) may land on a different stream than
+                                        // the cache D2D (multi-stream rotation in newer
+                                        // llama.cpp). Sync here so the D2D reads
+                                        // completed H2D data; otherwise the slot stores
+                                        // garbage and later hits produce garbage output.
+                                        ggml_backend_synchronize(split_backend);
                                         cache_set_fn(
                                             (const void *)(name_h ^ (uint64_t) e * 0x9E3779B97F4A7C15ULL),
                                             copy_len, dst_gpu, cs);
-                                    }
                                 }
                             } else {
                                 probe_hit++;
