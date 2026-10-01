@@ -13,7 +13,7 @@ from .predictor import (
     predict_hybrid,
 )
 
-__version__ = "0.14.0"
+__version__ = "0.14.1"
 __all__ = [
     "DOMAINS",
     "load_mapping",

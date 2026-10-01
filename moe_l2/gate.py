@@ -183,13 +183,14 @@ class RoutingProfiler:
                 os.environ.get("MOE_L2_SWAP_IDLE_SEC", "0.5"))
         except ValueError:
             self._idle_before_switch = 0.5
-        # [2026-09-19 安全默认] 表更新自动推送默认关闭。原因：换表路径在 C++ 侧
-        # 有并发缺陷（clear()/set_layer() 直接改全局 g_router_map，而推理线程同时
-        # 读它 → 越界访问 0xc0000005；210 实测 20 轮内复现，12 轮不换表则稳定）。
-        # 飞轮修活后推送频率上升会显著提高触发概率，因此先关；等 C++ 改成
-        # "构建新表 → 原子替换" 后再打开：MOE_L2_TABLE_PUSH=1。
+        # [2026-10-01 默认打开] 表更新自动推送改为**默认开启**。依据：换表路径的
+        # C++ 并发缺陷已修（写侧构建稿 + 读侧快照 + commit() 原子发布），
+        # 实测 Windows 25 轮 + 110 次生成中途换表零崩、Linux 40/40 次换表零崩
+        # （旧实现 Windows 崩在 ggml-base.dll 0xc0000005、Linux 第 2 次换表即死）。
+        # 关闭方式：MOE_L2_TABLE_PUSH=0（或 false/off/no）。
+        # 兼容旧写法：MOE_L2_TABLE_PUSH=1 仍视为开启。
         self._table_push_enabled = os.environ.get(
-            "MOE_L2_TABLE_PUSH", "").strip().lower() in ("1", "true", "on", "yes")
+            "MOE_L2_TABLE_PUSH", "1").strip().lower() not in ("0", "false", "off", "no")
         self._table_watch_thread: threading.Thread | None = None
         self._table_watch_stop: threading.Event | None = None
         # [2026-09-19 保护] 最近一条引擎日志的时刻：生成期间每 token 40 行日志，
@@ -274,8 +275,8 @@ class RoutingProfiler:
         if self.router_flywheel is None or not self.router_server_url:
             return None
         if not self._table_push_enabled:
-            logger.info("Gate: table auto-push disabled "
-                        "(set MOE_L2_TABLE_PUSH=1 to enable)")
+            logger.info("Gate: table auto-push disabled explicitly "
+                        "(MOE_L2_TABLE_PUSH=0); new table applies on next start")
             return None
         if self._table_watch_thread is not None:
             return self._table_watch_thread

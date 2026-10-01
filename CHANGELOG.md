@@ -6,6 +6,11 @@ Format: Keep a Changelog 1.1 style — Added / Changed / Fixed.
 
 ---
 
+## [0.14.1] - 2026-10-01
+
+### Changed
+- **表更新自动推送改为默认开启**（`MOE_L2_TABLE_PUSH` 默认 `1`；要关显式设 `0`/`false`/`off`）。依据：换表路径的 C++ 并发缺陷已修（写侧构建稿 + 读侧 `shared_ptr` 快照 + `ggml_backend_router_commit()` 原子发布），补丁版实测 Windows 25 轮 + 110 次生成中途换表零崩、Linux 40/40 次换表零崩（旧实现 Windows 崩在 `ggml-base.dll 0xc0000005`、Linux 第 2 次换表即打死进程）。**需配套 `bins-v0.8.1`**：若仍在用旧 bins，请先 `moe-l2 download-bins` 拉新版，或显式 `MOE_L2_TABLE_PUSH=0` 保持旧行为。
+
 ## [0.14.0] - 2026-10-01
 
 ### Fixed

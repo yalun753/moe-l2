@@ -1276,8 +1276,8 @@ def cmd_start(args):
             print("  gate:     online routing adaptation (LLAMA_EXPERT_LOG) enabled")
             print(f"  flywheel: router map auto-rebuild (domain_router_map_flywheel_{_fw_model_id}.json)")
             if not getattr(gate, "_table_push_enabled", False):
-                print("  flywheel: ⚠️ 表更新自动推送已关闭（MOE_L2_TABLE_PUSH=1 可开）"
-                      "——换表路径 C++ 侧有并发缺陷待修，新表将在下次启动生效")
+                print("  flywheel: ⚠️ 表更新自动推送被显式关闭（MOE_L2_TABLE_PUSH=0）"
+                      "——新表将在下次启动生效")
         except Exception as e:
             logger.warning("Gate init failed (non-fatal): %s", e)
             gate = None

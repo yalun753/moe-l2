@@ -252,7 +252,7 @@ def _d_profiler(tmp_path, monkeypatch):
     # 真实运行时 flywheel 是构造参数（__init__ 里就登记了表基线）；测试里是后挂
     # 上去的，这里补一次登记，等价于"进程启动那一刻"的表状态。
     p._table_sig = p._current_table_sig()
-    p._table_push_enabled = True   # 2026-09-19 起自动推送默认关，测试显式打开
+    p._table_push_enabled = True   # 2026-10-01 起默认即为 True；测试里显式写清意图
     return p, captured
 
 
@@ -376,17 +376,18 @@ def test_table_push_deferred_while_engine_busy(tmp_path, monkeypatch):
     assert _wait_until(lambda: p._table_pushes == 1)
 
 
-def test_table_push_and_watcher_disabled_by_default(monkeypatch):
-    """自动推表默认关闭（换表 C++ 侧并发缺陷待修）；MOE_L2_TABLE_PUSH=1 才开。"""
+def test_table_push_and_watcher_enabled_by_default(monkeypatch):
+    """自动推表默认**开启**（2026-10-01 起：C++ 换表竞态已修，补丁版实测
+    Windows 110 次 / Linux 40 次生成中途换表零崩）；MOE_L2_TABLE_PUSH=0 可关。"""
     monkeypatch.delenv("MOE_L2_TABLE_PUSH", raising=False)
     p = RoutingProfiler(retain_top_k=30, pool_size=3)
-    assert p._table_push_enabled is False
-    p.router_server_url = "http://127.0.0.1:8080"
-    p.router_flywheel = _FakeFlywheel(Path("/tmp/whatever.json"))
-    assert p.start_table_watcher() is None      # 不启动看门线程
+    assert p._table_push_enabled is True
+    monkeypatch.setenv("MOE_L2_TABLE_PUSH", "0")
+    p_off = RoutingProfiler(retain_top_k=30, pool_size=3)
+    assert p_off._table_push_enabled is False
     monkeypatch.setenv("MOE_L2_TABLE_PUSH", "1")
-    p2 = RoutingProfiler(retain_top_k=30, pool_size=3)
-    assert p2._table_push_enabled is True
+    p_on = RoutingProfiler(retain_top_k=30, pool_size=3)
+    assert p_on._table_push_enabled is True
 
 
 def test_idle_threshold_default_is_half_second(monkeypatch):
