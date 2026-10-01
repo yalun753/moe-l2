@@ -65,9 +65,9 @@
 moe-l2 start --model model.gguf --gpu --router-map v4_top100.map
 ```
 
-### 多架构二进制（bins-v0.8.0，2026-09-06）
+### 多架构二进制（bins-v0.8.1，2026-10-01）
 
-**一个二进制兼容所有 NVIDIA 显卡**——GTX 1080（sm_61）/ P100（sm_60）到 RTX 50 系（sm_120a），并从 bins-v0.8.0 起支持原生 Windows（`llama_bins_win.zip`）。CUDA 12.8 编译，无需按显卡单独编译，`moe-l2 download-bins` 自动拉取（PyPI 0.12.0 起按平台自动选 zip/tar.gz）。bins-v0.8.0 在 v0.7.0 引擎基础上新增 **sm_60 + sm_70**（P100 / V100 / Titan V）并附 **Windows zip**（llama-server.exe + DLLs，AVX2，内置 CUDA 12.8 runtime，驱动 ≥ 570）。v0.7.0 的功能全部继承：**IQ1_M 量化修复**（Qwen3.8-Flash-Next / Qwen4exp 125B 512 专家模型不再在 MMQ 崩溃——改走 MMVQ + 批上限拆分）+ **NCCL 多卡支持恢复**（打包内置 `libnccl.so.2`，`--split-mode layer/row/tensor` 恢复可用）+ selective pin（路由表驱动）+ GPU cache 预填充 + on-demand pin 主路径 + 专家页淘汰 v3.1 + 分层 pin + A3 cache 32768 槽 + 按领域动态换表（POST /moe-set-domain）+ per-slot 锁优化 + soft_resize / 保留热专家 v2（默认单表）+ 显存自适应主表 top-k + proxy 并发修复 + flywheel 表持久化。
+**一个二进制兼容所有 NVIDIA 显卡**——GTX 1080（sm_61）/ P100（sm_60）到 RTX 50 系（sm_120a），并从 bins-v0.8.0 起支持原生 Windows（`llama_bins_win.zip`）。CUDA 12.8 编译，无需按显卡单独编译，`moe-l2 download-bins` 自动拉取（PyPI 0.12.0 起按平台自动选 zip/tar.gz）。bins-v0.8.0 在 v0.7.0 引擎基础上新增 **sm_60 + sm_70**（P100 / V100 / Titan V）并附 **Windows zip**（llama-server.exe + DLLs，AVX2，内置 CUDA 12.8 runtime，驱动 ≥ 570）。v0.7.0 的功能全部继承：**IQ1_M 量化修复**（Qwen3.8-Flash-Next / Qwen4exp 125B 512 专家模型不再在 MMQ 崩溃——改走 MMVQ + 批上限拆分）+ **NCCL 多卡支持恢复**（打包内置 `libnccl.so.2`，`--split-mode layer/row/tensor` 恢复可用）+ selective pin（路由表驱动）+ GPU cache 预填充 + on-demand pin 主路径 + 专家页淘汰 v3.1 + 分层 pin + A3 cache 32768 槽 + 按领域动态换表（POST /moe-set-domain）+ per-slot 锁优化 + soft_resize / 保留热专家 v2（默认单表）+ 显存自适应主表 top-k + proxy 并发修复 + flywheel 表持久化。**bins-v0.8.1**（Linux 资产，2026-10-01）修掉「运行中换路由表把 `llama-server` 打死」的竞态：旧引擎是就地清空共享路由表、而推理线程同时在校验它。本次只替换 `libggml-base` + `libllama-server-impl` 两个库，其余文件与 v0.8.0 逐字节一致。实测（RTX 3080Ti 12G）：40 次生成中途换表零崩溃（旧版第 2 次就死）。Windows zip 本次未更新。
 
 | GPU | 架构 | DS-V2-Lite | Qwen3.6-A3B | Qwen4exp 125B IQ1_M | 显存 |
 |-----|------|-----------|-------------|---------------------|------|

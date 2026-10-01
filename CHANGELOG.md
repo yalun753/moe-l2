@@ -6,6 +6,18 @@ Format: Keep a Changelog 1.1 style — Added / Changed / Fixed.
 
 ---
 
+## [0.14.0] - 2026-10-01
+
+### Fixed
+- **运行中换路由表（`/moe-set-domain`）把引擎打死（Linux + Windows 同源）** — 旧实现 `clear()` 先清空全局路由表、再逐层 `set_layer()` 回填，推理线程并发读 `g_router_map[il]` → 越界访问。Windows 实测 `ggml-base.dll 0xc0000005`（偏移 `0x175ae`，2026-09-19 与 10-01 两次同偏移）；Linux 实测（AutoDL RTX 3080Ti 12G）**未打补丁的发布库第 2 次换表即崩**，补丁库 **40/40 次生成中途换表全部成功**（引擎日志 40 行 `router map committed`）。修法：写侧构建稿 + 读侧 `shared_ptr` 快照 + 新增 `ggml_backend_router_commit()` 原子发布；`server.cpp` 在全部 `set_layer()` 之后 commit。**需配套新 bins `bins-v0.8.1`**（仅替换 `libggml-base` 与 `libllama-server-impl` 两个库，其余文件与 v0.8.0 逐字节一致）。
+- **12G 卡 Linux 上长生成几轮后 CUDA OOM** — 自动 cache 槽数公式沿用 Windows 校准参数，在 Linux 上两处低估（固定开销 2.08 实测 3.3 GB；每槽 310 KB 实测 ~0.53 MiB，低估 1.75×）→ 12G/32K 算出 19987 槽、峰值顶到 12042/12288 MiB。改为平台分支：Linux 按实测常量反解 `(可用 − 3.3GB − KV − 1.3GB) / 0.53MiB`，Windows 保持 210 校准口径。12G/32K 自动 **12446 槽 → 峰值 11176 MiB**、6/6 长轮不崩；12G/256K 自动 **2725 槽 → 峰值 9514 MiB**、4/4。**纯 Python 修复，不需新 bins**。
+- **占位表期 A3 cache 不写回导致掉速** — `in_router` 判定改为「表里真有专家才算有表」，占位表视同无表 → cache 照常累积（实测占位期命中率 74%、22 t/s；旧为 9.35）。
+- 冷启动不再采集（`--auto-collect` 显式开启才采，解决首次启动卡十几分钟）；gate 日志读取修复（飞轮 / 漂移检测 / 高频专家提权此前从未真正运行）；飞轮重建节流 60s；占位表默认关（`MOE_L2_PLACEHOLDER_TABLE=1` 开启）。
+
+### Notes
+- `MOE_L2_TABLE_PUSH` 默认仍为关（本次未改默认）。
+- 与 `bins-v0.8.1` 配套使用；若仍用 `bins-v0.8.0`，换表路径的崩溃依旧存在。
+
 ## [0.13.1] - 2026-09-12
 
 ### Fixed
